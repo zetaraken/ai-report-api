@@ -1,6 +1,3 @@
-from __future__ import annotations
-from datetime import datetime, timedelta
-
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -40,6 +37,8 @@ class LoginRequest(BaseModel):
 class CrawlJobCreate(BaseModel):
     merchant_id: str
     period: str = "최근 6개월"
+    start_date: str | None = None
+    end_date: str | None = None
 
 
 def now_text() -> str:
@@ -126,6 +125,7 @@ MERCHANTS = [
 
 REPORTS: dict[str, dict[str, Any]] = {}
 
+
 def get_period_label(period: str = "최근 6개월", start_date: str | None = None, end_date: str | None = None) -> str:
     if period == "기간 설정":
         if start_date and end_date:
@@ -134,11 +134,12 @@ def get_period_label(period: str = "최근 6개월", start_date: str | None = No
 
     return period
 
+
 def make_sample_report(
     merchant: dict[str, Any],
     period: str = "최근 6개월",
     start_date: str | None = None,
-    end_date: str | None = None
+    end_date: str | None = None,
 ) -> dict[str, Any]:
     name = merchant["name"]
 
@@ -191,16 +192,14 @@ def make_sample_report(
     ]
 
     return {
-    "merchant_name": merchant["name"],
-    "region": merchant.get("region", ""),
-    "generated_at": now_text(),
-
-    "period": period,
-    "start_date": start_date,
-    "end_date": end_date,
-    "period_label": get_period_label(period, start_date, end_date),
-
-    "summary": summary,
+        "merchant_name": merchant["name"],
+        "region": merchant.get("region", ""),
+        "generated_at": now_text(),
+        "period": period,
+        "start_date": start_date,
+        "end_date": end_date,
+        "period_label": get_period_label(period, start_date, end_date),
+        "summary": summary,
         "monthly_summary": monthly,
         "channel_share": [
             {"name": "네이버 블로그", "value": summary["naver_blog_count"]},
@@ -269,46 +268,49 @@ def get_report(
     period: str = "최근 6개월",
     start_date: str | None = None,
     end_date: str | None = None,
-    admin: str = Depends(verify_token)
+    admin: str = Depends(verify_token),
 ):
-    if merchant_id not in REPORTS:
-        merchant = next((m for m in MERCHANTS if m["id"] == merchant_id), None)
+    merchant = next((m for m in MERCHANTS if m["id"] == merchant_id), None)
 
-        if not merchant:
-            raise HTTPException(status_code=404, detail="가맹점을 찾을 수 없습니다.")
+    if not merchant:
+        raise HTTPException(status_code=404, detail="가맹점을 찾을 수 없습니다.")
 
-        REPORTS[merchant_id] = make_sample_report(
-            merchant,
-            period=period,
-            start_date=start_date,
-            end_date=end_date
-        )
+    report = make_sample_report(
+        merchant,
+        period=period,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
-    report = REPORTS[merchant_id]
-    report["period"] = period
-    report["start_date"] = start_date
-    report["end_date"] = end_date
-    report["period_label"] = get_period_label(period, start_date, end_date)
-
+    REPORTS[merchant_id] = report
     return report
-    
-    if merchant_id not in REPORTS:
-        merchant = next((m for m in MERCHANTS if m["id"] == merchant_id), None)
-        if not merchant:
-            raise HTTPException(status_code=404, detail="가맹점을 찾을 수 없습니다.")
-        REPORTS[merchant_id] = make_sample_report(merchant)
-    return REPORTS[merchant_id]
 
 
 @app.post("/api/crawl-jobs")
 def create_crawl_job(payload: CrawlJobCreate, admin: str = Depends(verify_token)):
     merchant = next((m for m in MERCHANTS if m["id"] == payload.merchant_id), None)
+
     if not merchant:
         raise HTTPException(status_code=404, detail="가맹점을 찾을 수 없습니다.")
-    REPORTS[payload.merchant_id] = make_sample_report(merchant)
-    return {"id": f"job_{uuid4().hex[:10]}", "merchant_id": payload.merchant_id, "period": payload.period, "status": "completed", "created_at": now_text()}
+
+    REPORTS[payload.merchant_id] = make_sample_report(
+        merchant,
+        period=payload.period,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+    )
+
+    return {
+        "id": f"job_{uuid4().hex[:10]}",
+        "merchant_id": payload.merchant_id,
+        "period": payload.period,
+        "start_date": payload.start_date,
+        "end_date": payload.end_date,
+        "status": "completed",
+        "created_at": now_text(),
+    }
 
 
 @app.get("/api/reports/{merchant_id}/pdf")
 def get_pdf(merchant_id: str, period: str = "최근 6개월"):
-    return {"message": "PDF 기능은 다음 단계에서 연결됩니다.", "merchant_id": merchant_id}
+    return {"message": "PDF 기능은 다음 단계에서 연결됩니다.", "merchant_id": merchant_id, "period": period}
