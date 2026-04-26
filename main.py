@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.3.1")
+app = FastAPI(title="AI매출업 리포트 API", version="1.3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -275,12 +275,27 @@ def normalize_text(value: str) -> str:
     return re.sub(r"[^0-9a-zA-Z가-힣]", "", value or "").lower()
 
 
+def strip_html(value: str) -> str:
+    return unescape(re.sub(r"<.*?>", "", value or "")).strip()
+
+
+def extract_first(patterns: list[str], text: str) -> str:
+    for pattern in patterns:
+        m = re.search(pattern, text, re.S)
+        if m:
+            return strip_html(m.group(1))
+    return ""
+
+
 def is_relevant_youtube_video(merchant: dict[str, Any], title: str, channel: str) -> bool:
     merchant_name = merchant["name"]
     title_n = normalize_text(title)
     channel_n = normalize_text(channel)
     target_n = normalize_text(merchant_name)
     combined = title_n + channel_n
+
+    if not title_n:
+        return False
 
     if target_n and target_n in combined:
         return True
@@ -294,10 +309,76 @@ def is_relevant_youtube_video(merchant: dict[str, Any], title: str, channel: str
     return False
 
 
+def extract_youtube_candidates_from_html(html: str) -> list[dict[str, Any]]:
+    """
+    YouTube 검색 HTML에서 videoId 주변 JSON 조각을 기준으로 제목/채널/조회수/업로드시점을 추출합니다.
+    v4: title 추출 실패 시 '관련 영상' 같은 가짜 항목을 만들지 않고 제외합니다.
+    """
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for match in re.finditer(r'"videoId":"([^"]{8,20})"', html):
+        video_id = match.group(1)
+        if video_id in seen:
+            continue
+        seen.add(video_id)
+
+        start = max(0, match.start() - 3500)
+        end = min(len(html), match.end() + 6500)
+        chunk = html[start:end]
+
+        title = extract_first([
+            r'"title":\{"runs":\[\{"text":"(.*?)"\}\]',
+            r'"title":\{"simpleText":"(.*?)"\}',
+            r'"headline":\{"simpleText":"(.*?)"\}',
+            r'"accessibilityData":\{"label":"(.*?)"\}',
+        ], chunk)
+
+        # accessibility label은 제목 외 메타데이터가 붙을 수 있어 앞부분만 사용
+        if "게시자:" in title:
+            title = title.split("게시자:")[0].strip()
+        if " by " in title and " views" in title.lower():
+            title = title.split(" by ")[0].strip()
+
+        channel = extract_first([
+            r'"ownerText":\{"runs":\[\{"text":"(.*?)"',
+            r'"shortBylineText":\{"runs":\[\{"text":"(.*?)"',
+            r'"longBylineText":\{"runs":\[\{"text":"(.*?)"',
+            r'"channelName":"(.*?)"',
+        ], chunk)
+
+        view_text = extract_first([
+            r'"viewCountText":\{"simpleText":"(.*?)"\}',
+            r'"viewCountText":\{"runs":\[\{"text":"(.*?)"\}',
+            r'"shortViewCountText":\{"simpleText":"(.*?)"\}',
+            r'"shortViewCountText":\{"runs":\[\{"text":"(.*?)"\}',
+        ], chunk)
+
+        published_label = extract_first([
+            r'"publishedTimeText":\{"simpleText":"(.*?)"\}',
+            r'"publishedTimeText":\{"runs":\[\{"text":"(.*?)"\}',
+        ], chunk)
+
+        if not title:
+            continue
+
+        candidates.append({
+            "video_id": video_id,
+            "title": title,
+            "channel": channel or "YouTube",
+            "views": parse_compact_view_count(view_text),
+            "published_label": published_label,
+            "published_month_key": estimate_published_month_key(published_label),
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+        })
+
+    return candidates
+
+
 def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 12) -> dict[str, Any]:
     """
     YouTube 검색결과 HTML 비공식 수집.
-    v3: 업로드 시점 publishedTimeText를 파싱해 월별 유튜브 건수를 배분합니다.
+    v4: Shorts/일반영상 후보를 videoId 주변 JSON으로 재파싱하고, 제목 없는 가짜 항목을 제거합니다.
     """
     keywords = split_keywords(merchant.get("youtube_keywords")) or [merchant["name"]]
     videos: dict[str, dict[str, Any]] = {}
@@ -309,37 +390,19 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 1
             url = f"https://www.youtube.com/results?search_query={quote_plus(keyword)}"
             html = fetch_text(url)
 
-            video_ids = re.findall(r'"videoId":"([^"]{8,20})"', html)
-            titles = re.findall(r'"title":\{"runs":\[\{"text":"(.*?)"\}\]', html)
-            channels = re.findall(r'"ownerText":\{"runs":\[\{"text":"(.*?)"', html)
-            views = re.findall(r'"viewCountText":\{"simpleText":"(.*?)"\}', html)
-            published_times = re.findall(r'"publishedTimeText":\{"simpleText":"(.*?)"\}', html)
+            candidates = extract_youtube_candidates_from_html(html)
+            raw_candidates += len(candidates)
 
-            for idx, video_id in enumerate(video_ids):
-                raw_candidates += 1
-
+            for item in candidates:
+                video_id = item["video_id"]
                 if video_id in videos:
                     continue
 
-                title = unescape(titles[idx]) if idx < len(titles) else f"{keyword} 관련 영상"
-                channel = unescape(channels[idx]) if idx < len(channels) else "YouTube"
-                view_text = unescape(views[idx]) if idx < len(views) else ""
-                published_label = unescape(published_times[idx]) if idx < len(published_times) else ""
-                published_month_key = estimate_published_month_key(published_label)
-
-                if not is_relevant_youtube_video(merchant, title, channel):
+                if not is_relevant_youtube_video(merchant, item["title"], item["channel"]):
                     filtered_out += 1
                     continue
 
-                videos[video_id] = {
-                    "video_id": video_id,
-                    "title": title,
-                    "channel": channel,
-                    "views": parse_compact_view_count(view_text),
-                    "published_label": published_label,
-                    "published_month_key": published_month_key,
-                    "url": f"https://www.youtube.com/watch?v={video_id}",
-                }
+                videos[video_id] = item
 
                 if len(videos) >= max_results:
                     break
@@ -348,10 +411,13 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 1
                 break
 
         monthly_counts: dict[str, int] = {}
+        undated_count = 0
         for video in videos.values():
             key = video.get("published_month_key")
             if key:
                 monthly_counts[key] = monthly_counts.get(key, 0) + 1
+            else:
+                undated_count += 1
 
         top_videos = sorted(videos.values(), key=lambda x: x["views"], reverse=True)[:5]
 
@@ -367,7 +433,7 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 1
 
         return {
             "status": "ok",
-            "reason": f"정확 매칭+업로드월 파싱 적용. 후보 {raw_candidates}건 중 {filtered_out}건 제외",
+            "reason": f"정확 매칭+업로드월 파싱 적용. 후보 {raw_candidates}건 중 {filtered_out}건 제외, 날짜 미확인 {undated_count}건",
             "youtube_count": len(videos),
             "youtube_total_views": sum(v["views"] for v in videos.values()),
             "monthly_youtube_counts": monthly_counts,
@@ -844,7 +910,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.3.1"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.3.2"}
 
 
 @app.get("/api/health")
@@ -865,7 +931,7 @@ def debug_login_config():
 @app.get("/api/debug-source-config")
 def debug_source_config():
     return {
-        "youtube_collection_mode": "html_scrape_strict_with_published_month",
+        "youtube_collection_mode": "html_scrape_strict_with_published_month_v4_no_fake_titles",
         "naver_blog_collection_mode": "html_scrape",
         "naver_place_review_collection_mode": "mobile_html_scrape",
         "youtube_api_key_required": False,
