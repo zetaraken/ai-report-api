@@ -13,27 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
-# 1️⃣ 먼저 app 생성
-app = FastAPI()
-
-# 2️⃣ 그 다음 CORS 설정
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# 테스트용
-@app.get("/api/health")
-def health():
-    return {"status": "ok"}
-
-app = FastAPI(title="AI매출업 리포트 API", version="1.6.0")
+app = FastAPI(title="AI매출업 리포트 API", version="1.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -662,6 +643,7 @@ def extract_review_counts_from_text(page_text: str) -> tuple[int | None, int | N
     receipt_count = None
     blog_count = None
 
+    # 화면 텍스트 기준: 방문자 리뷰 / 블로그 리뷰 / 영수증 리뷰
     receipt_patterns = [
         r"방문자\s*리뷰\s*([0-9,]+)",
         r"방문자리뷰\s*([0-9,]+)",
@@ -688,9 +670,13 @@ def extract_review_counts_from_text(page_text: str) -> tuple[int | None, int | N
     return receipt_count, blog_count
 
 
-def parse_review_text_blocks(page_text: str, source: str, max_items: int = 800) -> list[dict[str, Any]]:
+def parse_review_dates_from_text(page_text: str, source: str, max_items: int = 1500) -> list[dict[str, Any]]:
+    """
+    네이버 플레이스 리뷰 화면 텍스트에서 날짜를 추출합니다.
+    같은 날짜에 여러 리뷰가 있는 경우 화면에 날짜가 반복 노출되는 구조를 반영하기 위해
+    '날짜 문자열 출현 횟수'를 리뷰 수 후보로 간주합니다.
+    """
     items: list[dict[str, Any]] = []
-    seen: set[str] = set()
 
     patterns = [
         r"20\d{2}\.\s*\d{1,2}\.\s*\d{1,2}\.?",
@@ -703,11 +689,9 @@ def parse_review_text_blocks(page_text: str, source: str, max_items: int = 800) 
             raw = m.group(0)
             parsed_date = parse_korean_absolute_date(raw)
             month_key = date_to_month_key(parsed_date)
-
-            if not parsed_date or parsed_date in seen:
+            if not parsed_date or not month_key:
                 continue
 
-            seen.add(parsed_date)
             items.append({
                 "published_date": parsed_date,
                 "month_key": month_key,
@@ -720,7 +704,7 @@ def parse_review_text_blocks(page_text: str, source: str, max_items: int = 800) 
     return items
 
 
-def click_possible_buttons(page, labels: list[str]) -> bool:
+def safe_click_by_text(page, labels: list[str]) -> bool:
     for label in labels:
         selectors = [
             f"text={label}",
@@ -732,7 +716,7 @@ def click_possible_buttons(page, labels: list[str]) -> bool:
             try:
                 loc = page.locator(selector).last
                 if loc.count() > 0 and loc.is_visible():
-                    loc.click(timeout=1000)
+                    loc.click(timeout=1200)
                     page.wait_for_timeout(700)
                     return True
             except Exception:
@@ -740,53 +724,48 @@ def click_possible_buttons(page, labels: list[str]) -> bool:
     return False
 
 
-def scroll_until_stable(page, max_rounds: int = 80, pause_ms: int = 650) -> None:
-    last_len = 0
-    stable_rounds = 0
+def scroll_page_until_no_growth(page, max_rounds: int = 120, pause_ms: int = 700) -> str:
+    """
+    네이버 플레이스 리뷰 탭을 가능한 끝까지 스크롤합니다.
+    DOM 높이/본문 길이 증가가 멈추면 중단합니다.
+    """
+    last_height = 0
+    last_text_len = 0
+    stable = 0
 
     for _ in range(max_rounds):
+        safe_click_by_text(page, ["더보기", "리뷰 더보기", "펼쳐보기"])
+
         try:
-            click_possible_buttons(page, ["더보기", "리뷰 더보기", "펼쳐보기", "더보기 접기"])
+            height = page.evaluate("() => document.body.scrollHeight")
+        except Exception:
+            height = 0
+
+        page.mouse.wheel(0, 2600)
+        page.wait_for_timeout(pause_ms)
+
+        try:
+            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(350)
         except Exception:
             pass
 
         try:
-            page.mouse.wheel(0, 2400)
-            page.wait_for_timeout(pause_ms)
-            current_text = page.inner_text("body", timeout=5000)
-            current_len = len(current_text)
-
-            if current_len <= last_len + 30:
-                stable_rounds += 1
-            else:
-                stable_rounds = 0
-                last_len = current_len
-
-            if stable_rounds >= 8:
-                break
+            body_text = page.inner_text("body", timeout=5000)
         except Exception:
-            continue
+            body_text = ""
 
+        text_len = len(body_text)
 
-def collect_place_tab_text(page, url: str, max_rounds: int = 80) -> str:
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(2500)
+        if height <= last_height + 50 and text_len <= last_text_len + 80:
+            stable += 1
+        else:
+            stable = 0
+            last_height = max(last_height, height)
+            last_text_len = max(last_text_len, text_len)
 
-    click_possible_buttons(page, ["확인", "닫기", "나중에", "취소"])
-
-    # iframe 대응: 일부 네이버 페이지는 frame 안에 본문이 들어갈 수 있음
-    try:
-        for frame in page.frames:
-            try:
-                frame_text = frame.locator("body").inner_text(timeout=4000)
-                if len(frame_text) > 500 and ("리뷰" in frame_text or "방문자" in frame_text):
-                    return frame_text
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    scroll_until_stable(page, max_rounds=max_rounds)
+        if stable >= 10:
+            break
 
     try:
         return page.inner_text("body", timeout=10000)
@@ -794,20 +773,63 @@ def collect_place_tab_text(page, url: str, max_rounds: int = 80) -> str:
         return ""
 
 
-def crawl_naver_place_with_playwright(place_id: str, max_clicks: int = 80) -> dict[str, Any]:
+def collect_naver_tab_text(page, urls: list[str], max_rounds: int) -> str:
     """
-    네이버 플레이스 리뷰 정밀 수집.
-    - 모바일 visitor/ugc 탭 분리 접근
-    - iframe 감지
-    - 무한스크롤 및 더보기 반복
-    - 카운트/날짜 파싱
+    후보 URL들을 순차 접근하며 가장 긴 텍스트를 채택합니다.
+    iframe이 존재하면 frame 텍스트도 병합합니다.
+    """
+    best_text = ""
+
+    for url in urls:
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=35000)
+            page.wait_for_timeout(2500)
+
+            safe_click_by_text(page, ["확인", "닫기", "나중에", "취소"])
+
+            text_parts = []
+            body_text = scroll_page_until_no_growth(page, max_rounds=max_rounds)
+            if body_text:
+                text_parts.append(body_text)
+
+            # iframe/frame 대응
+            try:
+                for frame in page.frames:
+                    try:
+                        frame_body = frame.locator("body")
+                        if frame_body.count() > 0:
+                            frame_text = frame_body.inner_text(timeout=5000)
+                            if frame_text and len(frame_text) > 200:
+                                text_parts.append(frame_text)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            combined = "\n".join(text_parts)
+            if len(combined) > len(best_text):
+                best_text = combined
+        except Exception:
+            continue
+
+    return best_text
+
+
+def crawl_naver_place_with_playwright(place_id: str, max_clicks: int = 120) -> dict[str, Any]:
+    """
+    네이버 플레이스 리뷰 정밀 수집 v3.
+    - 모바일 방문자 리뷰 탭
+    - 모바일 블로그 리뷰/UGC 탭
+    - iframe/frame 텍스트 병합
+    - 무한 스크롤 끝까지 반복
+    - 카운트와 날짜 파싱
     """
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
         return {
             "status": "fallback",
-            "reason": f"Playwright 미설치 또는 import 실패: {str(e)[:120]}",
+            "reason": f"Playwright import 실패: {str(e)[:120]}",
             "place_receipt_count": None,
             "place_blog_count": None,
             "receipt_items": [],
@@ -815,15 +837,18 @@ def crawl_naver_place_with_playwright(place_id: str, max_clicks: int = 80) -> di
         }
 
     visitor_urls = [
+        f"https://m.place.naver.com/restaurant/{place_id}/review/visitor?reviewSort=recent",
+        f"https://m.place.naver.com/place/{place_id}/review/visitor?reviewSort=recent",
         f"https://m.place.naver.com/restaurant/{place_id}/review/visitor",
         f"https://m.place.naver.com/place/{place_id}/review/visitor",
     ]
-    ugc_urls = [
+
+    blog_urls = [
         f"https://m.place.naver.com/restaurant/{place_id}/review/ugc",
         f"https://m.place.naver.com/place/{place_id}/review/ugc",
+        f"https://m.place.naver.com/restaurant/{place_id}/review/blog",
+        f"https://m.place.naver.com/place/{place_id}/review/blog",
     ]
-
-    last_error = ""
 
     try:
         with sync_playwright() as p:
@@ -845,32 +870,28 @@ def crawl_naver_place_with_playwright(place_id: str, max_clicks: int = 80) -> di
                 ),
                 locale="ko-KR",
                 timezone_id="Asia/Seoul",
+                extra_http_headers={
+                    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                },
             )
             page = context.new_page()
 
-            visitor_text = ""
-            for url in visitor_urls:
-                try:
-                    visitor_text = collect_place_tab_text(page, url, max_rounds=max_clicks)
-                    if len(visitor_text) > 500:
-                        break
-                except Exception as e:
-                    last_error = str(e)[:180]
+            visitor_text = collect_naver_tab_text(page, visitor_urls, max_rounds=max_clicks)
+            blog_text = collect_naver_tab_text(page, blog_urls, max_rounds=max(50, max_clicks // 2))
 
-            ugc_text = ""
-            for url in ugc_urls:
-                try:
-                    ugc_text = collect_place_tab_text(page, url, max_rounds=max(25, max_clicks // 2))
-                    if len(ugc_text) > 500:
-                        break
-                except Exception as e:
-                    last_error = str(e)[:180]
-
-            full_text = visitor_text + "\n" + ugc_text
+            full_text = visitor_text + "\n" + blog_text
             receipt_count, blog_count = extract_review_counts_from_text(full_text)
 
-            receipt_items = parse_review_text_blocks(visitor_text, "naver_place_receipt", max_items=1000)
-            place_blog_items = parse_review_text_blocks(ugc_text, "naver_place_blog", max_items=500)
+            receipt_items = parse_review_dates_from_text(
+                visitor_text,
+                source="naver_place_receipt",
+                max_items=2000,
+            )
+            place_blog_items = parse_review_dates_from_text(
+                blog_text,
+                source="naver_place_blog",
+                max_items=800,
+            )
 
             context.close()
             browser.close()
@@ -878,9 +899,9 @@ def crawl_naver_place_with_playwright(place_id: str, max_clicks: int = 80) -> di
             return {
                 "status": "ok",
                 "reason": (
-                    f"Playwright iframe+scroll 수집 완료. "
-                    f"visitor_text={len(visitor_text)}, ugc_text={len(ugc_text)}, "
-                    f"영수증 날짜 {len(receipt_items)}건, 블로그 날짜 {len(place_blog_items)}건"
+                    f"Playwright iframe+scroll+date v3 수집 완료. "
+                    f"visitor_text={len(visitor_text)}, blog_text={len(blog_text)}, "
+                    f"영수증 날짜후보={len(receipt_items)}, 블로그 날짜후보={len(place_blog_items)}"
                 ),
                 "place_receipt_count": receipt_count,
                 "place_blog_count": blog_count,
@@ -888,16 +909,14 @@ def crawl_naver_place_with_playwright(place_id: str, max_clicks: int = 80) -> di
                 "place_blog_items": place_blog_items,
             }
     except Exception as e:
-        last_error = str(e)[:180]
-
-    return {
-        "status": "fallback",
-        "reason": f"Playwright 네이버 플레이스 수집 실패: {last_error}",
-        "place_receipt_count": None,
-        "place_blog_count": None,
-        "receipt_items": [],
-        "place_blog_items": [],
-    }
+        return {
+            "status": "fallback",
+            "reason": f"Playwright 네이버 플레이스 수집 실패: {str(e)[:180]}",
+            "place_receipt_count": None,
+            "place_blog_count": None,
+            "receipt_items": [],
+            "place_blog_items": [],
+        }
 
 
 def collect_naver_place_review_counts(merchant: dict[str, Any], max_items: int = 300) -> dict[str, Any]:
@@ -1291,7 +1310,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.6.0"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.7.0"}
 
 
 @app.get("/api/health")
@@ -1314,7 +1333,7 @@ def debug_source_config():
     return {
         "youtube_collection_mode": "html_scrape_strict_with_published_month_v5_allocate_undated",
         "naver_blog_collection_mode": "html_scrape_with_post_date",
-        "naver_place_review_collection_mode": "playwright_iframe_scroll_date_parse_v2",
+        "naver_place_review_collection_mode": "playwright_iframe_scroll_date_parse_v3",
         "youtube_api_key_required": False,
     }
 
