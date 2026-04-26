@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.2.1")
+app = FastAPI(title="AI매출업 리포트 API", version="1.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -189,17 +189,93 @@ def parse_compact_view_count(text: str) -> int:
     return int(num)
 
 
+def build_recent_month_keys(month_count: int) -> list[str]:
+    today = datetime.now()
+    months: list[str] = []
+    year = today.year
+    month = today.month
+
+    for offset in range(month_count - 1, -1, -1):
+        y = year
+        m = month - offset
+        while m <= 0:
+            m += 12
+            y -= 1
+        months.append(f"{y}-{m:02d}")
+
+    return months
+
+
+def month_key_to_label(month_key: str) -> str:
+    year, month = month_key.split("-")
+    return f"{year}년 {int(month)}월"
+
+
+def estimate_published_month_key(label: str) -> str | None:
+    """
+    YouTube 검색 HTML의 publishedTimeText를 기준으로 업로드 월을 추정합니다.
+    예: '3개월 전', '2 weeks ago', '1 year ago'
+    """
+    if not label:
+        return None
+
+    text = label.strip().lower()
+    now = datetime.now()
+
+    m = re.search(r"(\d+)\s*(초|분|시간|일|주|개월|달|년)", text)
+    if m:
+        value = int(m.group(1))
+        unit = m.group(2)
+        if unit in ("초", "분", "시간"):
+            dt = now
+        elif unit == "일":
+            dt = now - timedelta(days=value)
+        elif unit == "주":
+            dt = now - timedelta(weeks=value)
+        elif unit in ("개월", "달"):
+            month = now.month - value
+            year = now.year
+            while month <= 0:
+                month += 12
+                year -= 1
+            dt = now.replace(year=year, month=month)
+        elif unit == "년":
+            dt = now.replace(year=now.year - value)
+        else:
+            dt = now
+        return f"{dt.year}-{dt.month:02d}"
+
+    m = re.search(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s+ago", text)
+    if m:
+        value = int(m.group(1))
+        unit = m.group(2)
+        if unit in ("second", "minute", "hour"):
+            dt = now
+        elif unit == "day":
+            dt = now - timedelta(days=value)
+        elif unit == "week":
+            dt = now - timedelta(weeks=value)
+        elif unit == "month":
+            month = now.month - value
+            year = now.year
+            while month <= 0:
+                month += 12
+                year -= 1
+            dt = now.replace(year=year, month=month)
+        elif unit == "year":
+            dt = now.replace(year=now.year - value)
+        else:
+            dt = now
+        return f"{dt.year}-{dt.month:02d}"
+
+    return None
+
+
 def normalize_text(value: str) -> str:
     return re.sub(r"[^0-9a-zA-Z가-힣]", "", value or "").lower()
 
 
 def is_relevant_youtube_video(merchant: dict[str, Any], title: str, channel: str) -> bool:
-    """
-    비공식 YouTube 검색 결과 오염 방지용 필터.
-    원칙:
-    1) 매장명이 제목/채널명에 정확히 포함되어야 함
-    2) 매장명 직접 매칭 실패 시, 등록된 유튜브 검색 키워드 전체 문구가 포함되어야 함
-    """
     merchant_name = merchant["name"]
     title_n = normalize_text(title)
     channel_n = normalize_text(channel)
@@ -218,10 +294,10 @@ def is_relevant_youtube_video(merchant: dict[str, Any], title: str, channel: str
     return False
 
 
-def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 8) -> dict[str, Any]:
+def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 12) -> dict[str, Any]:
     """
-    YouTube 검색결과 HTML에서 videoId/title/channel/viewCount를 추출하는 비공식 수집.
-    v2: 매장명/검색어 정확 매칭 필터를 적용해 일반 감자탕·먹방 영상 오염을 제거합니다.
+    YouTube 검색결과 HTML 비공식 수집.
+    v3: 업로드 시점 publishedTimeText를 파싱해 월별 유튜브 건수를 배분합니다.
     """
     keywords = split_keywords(merchant.get("youtube_keywords")) or [merchant["name"]]
     videos: dict[str, dict[str, Any]] = {}
@@ -237,6 +313,7 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 8
             titles = re.findall(r'"title":\{"runs":\[\{"text":"(.*?)"\}\]', html)
             channels = re.findall(r'"ownerText":\{"runs":\[\{"text":"(.*?)"', html)
             views = re.findall(r'"viewCountText":\{"simpleText":"(.*?)"\}', html)
+            published_times = re.findall(r'"publishedTimeText":\{"simpleText":"(.*?)"\}', html)
 
             for idx, video_id in enumerate(video_ids):
                 raw_candidates += 1
@@ -247,6 +324,8 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 8
                 title = unescape(titles[idx]) if idx < len(titles) else f"{keyword} 관련 영상"
                 channel = unescape(channels[idx]) if idx < len(channels) else "YouTube"
                 view_text = unescape(views[idx]) if idx < len(views) else ""
+                published_label = unescape(published_times[idx]) if idx < len(published_times) else ""
+                published_month_key = estimate_published_month_key(published_label)
 
                 if not is_relevant_youtube_video(merchant, title, channel):
                     filtered_out += 1
@@ -257,6 +336,8 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 8
                     "title": title,
                     "channel": channel,
                     "views": parse_compact_view_count(view_text),
+                    "published_label": published_label,
+                    "published_month_key": published_month_key,
                     "url": f"https://www.youtube.com/watch?v={video_id}",
                 }
 
@@ -266,6 +347,12 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 8
             if len(videos) >= max_results:
                 break
 
+        monthly_counts: dict[str, int] = {}
+        for video in videos.values():
+            key = video.get("published_month_key")
+            if key:
+                monthly_counts[key] = monthly_counts.get(key, 0) + 1
+
         top_videos = sorted(videos.values(), key=lambda x: x["views"], reverse=True)[:5]
 
         if not videos:
@@ -274,19 +361,22 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 8
                 "reason": f"정확 매칭 영상 없음. 후보 {raw_candidates}건 중 {filtered_out}건 제외",
                 "youtube_count": 0,
                 "youtube_total_views": 0,
+                "monthly_youtube_counts": {},
                 "top_videos": [],
             }
 
         return {
             "status": "ok",
-            "reason": f"정확 매칭 적용. 후보 {raw_candidates}건 중 {filtered_out}건 제외",
+            "reason": f"정확 매칭+업로드월 파싱 적용. 후보 {raw_candidates}건 중 {filtered_out}건 제외",
             "youtube_count": len(videos),
             "youtube_total_views": sum(v["views"] for v in videos.values()),
+            "monthly_youtube_counts": monthly_counts,
             "top_videos": [
                 {
                     "title": v["title"],
                     "channel": v["channel"],
                     "views": v["views"],
+                    "published": v.get("published_label", ""),
                 }
                 for v in top_videos
             ],
@@ -297,6 +387,7 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 8
             "reason": f"YouTube 비공식 크롤링 오류: {str(e)[:140]}",
             "youtube_count": None,
             "youtube_total_views": None,
+            "monthly_youtube_counts": {},
             "top_videos": [],
         }
 
@@ -358,12 +449,14 @@ def make_sample_report(
     if period in ("custom", "기간 설정"):
         month_count = 6
 
+    month_keys = build_recent_month_keys(month_count)
     monthly_rows = expand_monthly(data["monthly"], month_count)
     monthly = []
-    for i, row in enumerate(monthly_rows, start=1):
+    for i, row in enumerate(monthly_rows):
         blog, insta, receipt, place_blog, youtube = row
         monthly.append({
-            "month": f"{i}월",
+            "month": month_key_to_label(month_keys[i]),
+            "month_key": month_keys[i],
             "blog_count": blog,
             "instagram_count": insta,
             "place_receipt_count": receipt,
@@ -411,6 +504,21 @@ def make_sample_report(
         if youtube_result["status"] == "ok":
             youtube_count = youtube_result["youtube_count"] or 0
             summary["youtube_total_views"] = youtube_result["youtube_total_views"] or 0
+
+            monthly_youtube_counts = youtube_result.get("monthly_youtube_counts", {})
+            youtube_count = 0
+            for row in monthly:
+                matched_count = int(monthly_youtube_counts.get(row["month_key"], 0))
+                row["youtube_count"] = matched_count
+                row["total_count"] = (
+                    row["blog_count"]
+                    + row["instagram_count"]
+                    + row["place_receipt_count"]
+                    + row["place_blog_count"]
+                    + row["youtube_count"]
+                )
+                youtube_count += matched_count
+
             if youtube_result["top_videos"]:
                 top_videos = youtube_result["top_videos"]
 
@@ -452,7 +560,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.2.1"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.2.2"}
 
 
 @app.get("/api/health")
@@ -473,7 +581,7 @@ def debug_login_config():
 @app.get("/api/debug-source-config")
 def debug_source_config():
     return {
-        "youtube_collection_mode": "html_scrape",
+        "youtube_collection_mode": "html_scrape_strict_with_published_month",
         "youtube_api_key_required": False,
     }
 
