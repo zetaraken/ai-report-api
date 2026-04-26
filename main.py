@@ -1,6 +1,9 @@
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -9,7 +12,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.0.1")
+app = FastAPI(title="AI매출업 리포트 API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,12 +24,13 @@ app.add_middleware(
 
 security = HTTPBearer()
 
-# Railway 환경변수가 안 먹어도 로그인되도록 기본값을 실제 테스트 계정으로 고정
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "zetarise@gmail.com").strip()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "4858").strip()
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "ai-report-secret-2026").strip()
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = 720
+
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
 
 class LoginRequest(BaseModel):
@@ -127,22 +131,127 @@ REPORTS: dict[str, dict[str, Any]] = {}
 
 
 def get_period_label(period: str = "최근 6개월", start_date: str | None = None, end_date: str | None = None) -> str:
+    if period == "custom":
+        return f"{start_date} ~ {end_date}" if start_date and end_date else "기간 설정"
     if period == "기간 설정":
-        if start_date and end_date:
-            return f"{start_date} ~ {end_date}"
-        return "기간 설정"
-
+        return f"{start_date} ~ {end_date}" if start_date and end_date else "기간 설정"
     return period
 
 
-def make_sample_report(
-    merchant: dict[str, Any],
-    period: str = "최근 6개월",
-    start_date: str | None = None,
-    end_date: str | None = None,
-) -> dict[str, Any]:
-    name = merchant["name"]
+def get_month_count(period: str) -> int:
+    if period == "최근 1개월":
+        return 1
+    if period == "최근 3개월":
+        return 3
+    if period == "최근 1년":
+        return 12
+    return 6
 
+
+def split_keywords(value: str | list[str] | None) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [v.strip() for v in str(value).split(",") if v.strip()]
+
+
+def http_get_json(url: str) -> dict[str, Any]:
+    req = Request(url, headers={"User-Agent": "ai-report-api/1.1"})
+    with urlopen(req, timeout=12) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def collect_youtube_data(merchant: dict[str, Any], max_results: int = 5) -> dict[str, Any]:
+    """
+    YouTube Data API v3 기반 실제 수집.
+    YOUTUBE_API_KEY가 없거나 API 오류가 나면 status가 fallback으로 반환됩니다.
+    """
+    if not YOUTUBE_API_KEY:
+        return {
+            "status": "fallback",
+            "reason": "YOUTUBE_API_KEY 미설정",
+            "youtube_count": None,
+            "youtube_total_views": None,
+            "top_videos": [],
+        }
+
+    keywords = split_keywords(merchant.get("youtube_keywords")) or [merchant["name"]]
+    video_map: dict[str, dict[str, Any]] = {}
+
+    try:
+        for keyword in keywords:
+            search_params = urlencode({
+                "part": "snippet",
+                "q": keyword,
+                "type": "video",
+                "maxResults": max_results,
+                "order": "relevance",
+                "regionCode": "KR",
+                "key": YOUTUBE_API_KEY,
+            })
+            search_url = f"https://www.googleapis.com/youtube/v3/search?{search_params}"
+            search_data = http_get_json(search_url)
+
+            for item in search_data.get("items", []):
+                video_id = item.get("id", {}).get("videoId")
+                snippet = item.get("snippet", {})
+                if not video_id:
+                    continue
+                video_map[video_id] = {
+                    "video_id": video_id,
+                    "title": snippet.get("title", ""),
+                    "channel": snippet.get("channelTitle", ""),
+                    "published_at": snippet.get("publishedAt", ""),
+                    "views": 0,
+                }
+
+        if not video_map:
+            return {
+                "status": "ok",
+                "reason": "검색 결과 없음",
+                "youtube_count": 0,
+                "youtube_total_views": 0,
+                "top_videos": [],
+            }
+
+        ids = ",".join(video_map.keys())
+        videos_params = urlencode({
+            "part": "statistics,snippet",
+            "id": ids,
+            "key": YOUTUBE_API_KEY,
+        })
+        videos_url = f"https://www.googleapis.com/youtube/v3/videos?{videos_params}"
+        videos_data = http_get_json(videos_url)
+
+        for item in videos_data.get("items", []):
+            video_id = item.get("id")
+            stats = item.get("statistics", {})
+            if video_id in video_map:
+                video_map[video_id]["views"] = int(stats.get("viewCount", 0))
+
+        top_videos = sorted(video_map.values(), key=lambda x: x["views"], reverse=True)[:5]
+        return {
+            "status": "ok",
+            "reason": "",
+            "youtube_count": len(video_map),
+            "youtube_total_views": sum(v["views"] for v in video_map.values()),
+            "top_videos": [
+                {"title": v["title"], "channel": v["channel"], "views": v["views"]}
+                for v in top_videos
+            ],
+        }
+    except Exception as e:
+        return {
+            "status": "fallback",
+            "reason": f"YouTube API 오류: {str(e)[:120]}",
+            "youtube_count": None,
+            "youtube_total_views": None,
+            "top_videos": [],
+        }
+
+
+def make_base_sample_data(name: str) -> dict[str, Any]:
     sample_data = {
         "배포차": {
             "monthly": [(18, 42, 9, 5, 6), (22, 57, 11, 7, 7), (29, 66, 13, 8, 10), (34, 88, 17, 10, 11)],
@@ -170,10 +279,38 @@ def make_sample_report(
             "videos": [("라이브볼 역삼점 방문 후기", "역삼맛집로그", 17500), ("역삼역 라이브볼 분위기 리뷰", "강남데이트코스", 14200)],
         },
     }
+    return sample_data.get(name, sample_data["배포차"])
 
-    data = sample_data.get(name, sample_data["배포차"])
+
+def expand_monthly(base_rows: list[tuple[int, int, int, int, int]], months: int) -> list[tuple[int, int, int, int, int]]:
+    if months <= len(base_rows):
+        return base_rows[-months:]
+
+    rows = list(base_rows)
+    while len(rows) < months:
+        last = rows[-1]
+        growth = 1.06 + (len(rows) % 3) * 0.02
+        rows.append(tuple(max(1, int(v * growth)) for v in last))
+    return rows[-months:]
+
+
+def make_sample_report(
+    merchant: dict[str, Any],
+    period: str = "최근 6개월",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    use_live_youtube: bool = False,
+) -> dict[str, Any]:
+    name = merchant["name"]
+    data = make_base_sample_data(name)
+
+    month_count = get_month_count(period)
+    if period in ("custom", "기간 설정"):
+        month_count = 6
+
+    monthly_rows = expand_monthly(data["monthly"], month_count)
     monthly = []
-    for i, row in enumerate(data["monthly"], start=1):
+    for i, row in enumerate(monthly_rows, start=1):
         blog, insta, receipt, place_blog, youtube = row
         monthly.append({
             "month": f"{i}월",
@@ -185,11 +322,47 @@ def make_sample_report(
             "total_count": blog + insta + receipt + place_blog + youtube,
         })
 
-    summary = data["summary"]
+    summary = {
+        "naver_blog_count": sum(r["blog_count"] for r in monthly),
+        "instagram_count": sum(r["instagram_count"] for r in monthly),
+        "place_receipt_count": sum(r["place_receipt_count"] for r in monthly),
+        "place_blog_count": sum(r["place_blog_count"] for r in monthly),
+        "youtube_total_views": data["summary"]["youtube_total_views"],
+        "ad_ratio": data["summary"]["ad_ratio"],
+        "self_ratio": data["summary"]["self_ratio"],
+    }
+
+    youtube_count = sum(r["youtube_count"] for r in monthly)
     top_videos = [
         {"title": title, "channel": channel, "views": views}
         for title, channel, views in data["videos"]
     ]
+    source_status = {
+        "youtube": {
+            "status": "sample",
+            "reason": "수집 전 샘플 데이터",
+        }
+    }
+
+    if use_live_youtube:
+        youtube_result = collect_youtube_data(merchant)
+        source_status["youtube"] = {
+            "status": youtube_result["status"],
+            "reason": youtube_result["reason"],
+        }
+        if youtube_result["status"] == "ok":
+            youtube_count = youtube_result["youtube_count"] or 0
+            summary["youtube_total_views"] = youtube_result["youtube_total_views"] or 0
+            if youtube_result["top_videos"]:
+                top_videos = youtube_result["top_videos"]
+
+    summary["total_mentions"] = (
+        summary["naver_blog_count"]
+        + summary["instagram_count"]
+        + summary["place_receipt_count"]
+        + summary["place_blog_count"]
+        + youtube_count
+    )
 
     return {
         "merchant_name": merchant["name"],
@@ -199,6 +372,7 @@ def make_sample_report(
         "start_date": start_date,
         "end_date": end_date,
         "period_label": get_period_label(period, start_date, end_date),
+        "source_status": source_status,
         "summary": summary,
         "monthly_summary": monthly,
         "channel_share": [
@@ -206,7 +380,7 @@ def make_sample_report(
             {"name": "인스타그램", "value": summary["instagram_count"]},
             {"name": "영수증 리뷰", "value": summary["place_receipt_count"]},
             {"name": "플레이스 블로그 리뷰", "value": summary["place_blog_count"]},
-            {"name": "유튜브", "value": sum(r["youtube_count"] for r in monthly)},
+            {"name": "유튜브", "value": youtube_count},
         ],
         "top_videos": top_videos,
         "insights": [
@@ -220,7 +394,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.1.0"}
 
 
 @app.get("/api/health")
@@ -238,6 +412,14 @@ def debug_login_config():
     }
 
 
+@app.get("/api/debug-source-config")
+def debug_source_config():
+    return {
+        "youtube_api_key_set": bool(YOUTUBE_API_KEY),
+        "youtube_api_key_length": len(YOUTUBE_API_KEY),
+    }
+
+
 @app.post("/api/auth/login")
 def login(payload: LoginRequest):
     input_email = payload.email.strip()
@@ -246,7 +428,7 @@ def login(payload: LoginRequest):
     if input_email != ADMIN_EMAIL or input_password != ADMIN_PASSWORD:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"이메일 또는 비밀번호가 올바르지 않습니다. server_email={ADMIN_EMAIL}, password_length={len(ADMIN_PASSWORD)}",
+            detail="이메일 또는 비밀번호가 올바르지 않습니다.",
         )
 
     return {
@@ -268,21 +450,29 @@ def get_report(
     period: str = "최근 6개월",
     start_date: str | None = None,
     end_date: str | None = None,
-    admin: str = Depends(verify_token),
+    admin: str = Depends(verify_token)
 ):
     merchant = next((m for m in MERCHANTS if m["id"] == merchant_id), None)
 
     if not merchant:
         raise HTTPException(status_code=404, detail="가맹점을 찾을 수 없습니다.")
 
-    report = make_sample_report(
-        merchant,
-        period=period,
-        start_date=start_date,
-        end_date=end_date,
-    )
+    report = REPORTS.get(merchant_id)
+    if not report:
+        report = make_sample_report(
+            merchant,
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            use_live_youtube=False,
+        )
+        REPORTS[merchant_id] = report
 
-    REPORTS[merchant_id] = report
+    report["period"] = period
+    report["start_date"] = start_date
+    report["end_date"] = end_date
+    report["period_label"] = get_period_label(period, start_date, end_date)
+
     return report
 
 
@@ -298,6 +488,7 @@ def create_crawl_job(payload: CrawlJobCreate, admin: str = Depends(verify_token)
         period=payload.period,
         start_date=payload.start_date,
         end_date=payload.end_date,
+        use_live_youtube=True,
     )
 
     return {
@@ -307,7 +498,8 @@ def create_crawl_job(payload: CrawlJobCreate, admin: str = Depends(verify_token)
         "start_date": payload.start_date,
         "end_date": payload.end_date,
         "status": "completed",
-        "created_at": now_text(),
+        "source_status": REPORTS[payload.merchant_id].get("source_status", {}),
+        "created_at": now_text()
     }
 
 
