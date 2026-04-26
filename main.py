@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.2.0")
+app = FastAPI(title="AI매출업 리포트 API", version="1.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -189,31 +189,69 @@ def parse_compact_view_count(text: str) -> int:
     return int(num)
 
 
+def normalize_text(value: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z가-힣]", "", value or "").lower()
+
+
+def is_relevant_youtube_video(merchant: dict[str, Any], title: str, channel: str) -> bool:
+    """
+    비공식 YouTube 검색 결과 오염 방지용 필터.
+    원칙:
+    1) 매장명이 제목/채널명에 정확히 포함되어야 함
+    2) 매장명 직접 매칭 실패 시, 등록된 유튜브 검색 키워드 전체 문구가 포함되어야 함
+    """
+    merchant_name = merchant["name"]
+    title_n = normalize_text(title)
+    channel_n = normalize_text(channel)
+    target_n = normalize_text(merchant_name)
+    combined = title_n + channel_n
+
+    if target_n and target_n in combined:
+        return True
+
+    keywords = split_keywords(merchant.get("youtube_keywords"))
+    for keyword in keywords:
+        keyword_n = normalize_text(keyword)
+        if keyword_n and keyword_n in combined:
+            return True
+
+    return False
+
+
 def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 8) -> dict[str, Any]:
     """
     YouTube 검색결과 HTML에서 videoId/title/channel/viewCount를 추출하는 비공식 수집.
-    YouTube 구조 변경·차단 시 fallback 처리됩니다.
+    v2: 매장명/검색어 정확 매칭 필터를 적용해 일반 감자탕·먹방 영상 오염을 제거합니다.
     """
     keywords = split_keywords(merchant.get("youtube_keywords")) or [merchant["name"]]
     videos: dict[str, dict[str, Any]] = {}
+    raw_candidates = 0
+    filtered_out = 0
 
     try:
         for keyword in keywords:
             url = f"https://www.youtube.com/results?search_query={quote_plus(keyword)}"
             html = fetch_text(url)
 
-            # 1차: HTML 내 JSON 조각에서 videoRenderer 단위 추출
             video_ids = re.findall(r'"videoId":"([^"]{8,20})"', html)
             titles = re.findall(r'"title":\{"runs":\[\{"text":"(.*?)"\}\]', html)
             channels = re.findall(r'"ownerText":\{"runs":\[\{"text":"(.*?)"', html)
             views = re.findall(r'"viewCountText":\{"simpleText":"(.*?)"\}', html)
 
             for idx, video_id in enumerate(video_ids):
+                raw_candidates += 1
+
                 if video_id in videos:
                     continue
+
                 title = unescape(titles[idx]) if idx < len(titles) else f"{keyword} 관련 영상"
                 channel = unescape(channels[idx]) if idx < len(channels) else "YouTube"
                 view_text = unescape(views[idx]) if idx < len(views) else ""
+
+                if not is_relevant_youtube_video(merchant, title, channel):
+                    filtered_out += 1
+                    continue
+
                 videos[video_id] = {
                     "video_id": video_id,
                     "title": title,
@@ -221,6 +259,7 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 8
                     "views": parse_compact_view_count(view_text),
                     "url": f"https://www.youtube.com/watch?v={video_id}",
                 }
+
                 if len(videos) >= max_results:
                     break
 
@@ -229,9 +268,18 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 8
 
         top_videos = sorted(videos.values(), key=lambda x: x["views"], reverse=True)[:5]
 
+        if not videos:
+            return {
+                "status": "ok",
+                "reason": f"정확 매칭 영상 없음. 후보 {raw_candidates}건 중 {filtered_out}건 제외",
+                "youtube_count": 0,
+                "youtube_total_views": 0,
+                "top_videos": [],
+            }
+
         return {
-            "status": "ok" if videos else "fallback",
-            "reason": "" if videos else "YouTube 검색 결과 파싱 실패 또는 결과 없음",
+            "status": "ok",
+            "reason": f"정확 매칭 적용. 후보 {raw_candidates}건 중 {filtered_out}건 제외",
             "youtube_count": len(videos),
             "youtube_total_views": sum(v["views"] for v in videos.values()),
             "top_videos": [
@@ -404,7 +452,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.2.0"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.2.1"}
 
 
 @app.get("/api/health")
