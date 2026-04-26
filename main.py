@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.3.3")
+app = FastAPI(title="AI매출업 리포트 API", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -507,38 +507,92 @@ def parse_naver_count(text: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-def collect_naver_blog_search(merchant: dict[str, Any], max_results: int = 30) -> dict[str, Any]:
+def parse_korean_absolute_date(value: str) -> str | None:
+    """
+    2026.04.26 / 2026-04-26 / 2026년 4월 26일 / 04.26 형태를 YYYY-MM-DD로 정규화합니다.
+    연도가 없는 MM.DD는 현재 연도로 추정합니다.
+    """
+    if not value:
+        return None
+
+    s = strip_html(value).replace(" ", "")
+
+    m = re.search(r"(20\d{2})[.\-/년](\d{1,2})[.\-/월](\d{1,2})", s)
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+    m = re.search(r"(\d{1,2})[.월](\d{1,2})", s)
+    if m:
+        now = datetime.now()
+        return f"{now.year:04d}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+
+    return None
+
+
+def date_to_month_key(date_value: str | None) -> str | None:
+    if not date_value:
+        return None
+    m = re.search(r"(20\d{2})-(\d{2})-\d{2}", date_value)
+    if not m:
+        return None
+    return f"{m.group(1)}-{m.group(2)}"
+
+
+def distribute_items_by_month(items: list[dict[str, Any]], month_keys: list[str]) -> dict[str, int]:
+    counts = {key: 0 for key in month_keys}
+    for item in items:
+        key = item.get("month_key")
+        if key in counts:
+            counts[key] += 1
+    return counts
+
+
+def collect_naver_blog_search(merchant: dict[str, Any], max_results: int = 50) -> dict[str, Any]:
     """
     네이버 블로그 검색 HTML 기반 비공식 수집.
-    검색결과 HTML 구조 변경 시 fallback 처리됩니다.
+    v2: 검색결과에서 블로그 게시일을 함께 파싱해 월별 배분에 사용합니다.
     """
     keywords = split_keywords(merchant.get("blog_keywords")) or [merchant["name"]]
     posts: dict[str, dict[str, Any]] = {}
     raw_candidates = 0
     filtered_out = 0
+    undated_count = 0
 
     try:
         for keyword in keywords:
             url = f"https://search.naver.com/search.naver?where=blog&query={quote_plus(keyword)}"
             html = fetch_text(url)
 
-            # 네이버 검색결과의 블로그 링크 후보
-            links = re.findall(r'href="(https://blog\.naver\.com/[^"]+)"', html)
-            titles = re.findall(r'<a[^>]+class="[^"]*(?:title_link|api_txt_lines)[^"]*"[^>]*>(.*?)</a>', html, re.S)
-
-            for i, link in enumerate(links):
+            # 검색 결과 블록 단위 후보. 네이버 구조 변경에 대비해 링크 기준으로 주변 chunk를 잘라 파싱
+            for link_match in re.finditer(r'href="(https://blog\.naver\.com/[^"]+)"', html):
+                link = link_match.group(1)
                 raw_candidates += 1
+
                 if link in posts:
                     continue
 
-                title_html = titles[i] if i < len(titles) else ""
-                title = re.sub(r"<.*?>", "", title_html)
-                title = unescape(title).strip()
+                chunk_start = max(0, link_match.start() - 2500)
+                chunk_end = min(len(html), link_match.end() + 3500)
+                chunk = html[chunk_start:chunk_end]
+
+                title = extract_first([
+                    r'class="[^"]*(?:title_link|api_txt_lines)[^"]*"[^>]*>(.*?)</a>',
+                    r'<a[^>]+href="' + re.escape(link) + r'"[^>]*>(.*?)</a>',
+                ], chunk)
+
+                date_raw = extract_first([
+                    r'class="[^"]*(?:sub_time|date|time|etc_dsc_area)[^"]*"[^>]*>(.*?)</span>',
+                    r'(\d{4}\.\d{1,2}\.\d{1,2}\.?)',
+                    r'(\d{4}-\d{1,2}-\d{1,2})',
+                    r'(\d{1,2}\.\d{1,2}\.?)',
+                ], chunk)
+
+                published_date = parse_korean_absolute_date(date_raw)
+                month_key = date_to_month_key(published_date)
 
                 combined = normalize_text(title + " " + link)
                 merchant_name = normalize_text(merchant["name"])
 
-                # 매장명 또는 등록 검색어 전체 문구가 포함되어야 인정
                 relevant = merchant_name in combined if merchant_name else False
                 if not relevant:
                     for keyword_check in keywords:
@@ -550,9 +604,14 @@ def collect_naver_blog_search(merchant: dict[str, Any], max_results: int = 30) -
                     filtered_out += 1
                     continue
 
+                if not month_key:
+                    undated_count += 1
+
                 posts[link] = {
                     "title": title or merchant["name"] + " 관련 블로그",
                     "url": link,
+                    "published_date": published_date,
+                    "month_key": month_key,
                     "source": "naver_blog",
                 }
 
@@ -562,11 +621,13 @@ def collect_naver_blog_search(merchant: dict[str, Any], max_results: int = 30) -
             if len(posts) >= max_results:
                 break
 
+        items = list(posts.values())
         return {
             "status": "ok",
-            "reason": f"네이버 블로그 검색 수집. 후보 {raw_candidates}건 중 {filtered_out}건 제외",
-            "count": len(posts),
-            "items": list(posts.values())[:10],
+            "reason": f"네이버 블로그 검색 수집. 후보 {raw_candidates}건 중 {filtered_out}건 제외, 날짜 미확인 {undated_count}건",
+            "count": len(items),
+            "items": items[:20],
+            "undated_count": undated_count,
         }
     except Exception as e:
         return {
@@ -574,13 +635,14 @@ def collect_naver_blog_search(merchant: dict[str, Any], max_results: int = 30) -
             "reason": f"네이버 블로그 수집 오류: {str(e)[:140]}",
             "count": None,
             "items": [],
+            "undated_count": 0,
         }
 
 
-def collect_naver_place_review_counts(merchant: dict[str, Any]) -> dict[str, Any]:
+def collect_naver_place_review_counts(merchant: dict[str, Any], max_items: int = 80) -> dict[str, Any]:
     """
-    네이버 플레이스 모바일 페이지에서 방문자 리뷰/블로그 리뷰 카운트를 추출하는 비공식 수집.
-    naver.me 단축 URL은 최종 URL로 resolve 후 place id를 추정합니다.
+    네이버 플레이스 모바일 페이지에서 방문자 리뷰/블로그 리뷰 카운트와 일부 리뷰 날짜를 추출하는 비공식 수집.
+    v2: 가능한 경우 리뷰 본문 주변 날짜를 파싱해 월별 배분에 사용합니다.
     """
     place_url = merchant.get("naver_place_url", "")
     place_id = extract_naver_place_id(place_url)
@@ -592,6 +654,8 @@ def collect_naver_place_review_counts(merchant: dict[str, Any]) -> dict[str, Any
             "place_id": None,
             "place_receipt_count": None,
             "place_blog_count": None,
+            "receipt_items": [],
+            "place_blog_items": [],
         }
 
     candidate_urls = [
@@ -599,6 +663,8 @@ def collect_naver_place_review_counts(merchant: dict[str, Any]) -> dict[str, Any
         f"https://m.place.naver.com/place/{place_id}/home",
         f"https://m.place.naver.com/restaurant/{place_id}/review/visitor",
         f"https://m.place.naver.com/place/{place_id}/review/visitor",
+        f"https://m.place.naver.com/restaurant/{place_id}/review/ugc",
+        f"https://m.place.naver.com/place/{place_id}/review/ugc",
     ]
 
     try:
@@ -616,6 +682,8 @@ def collect_naver_place_review_counts(merchant: dict[str, Any]) -> dict[str, Any
                 "place_id": place_id,
                 "place_receipt_count": None,
                 "place_blog_count": None,
+                "receipt_items": [],
+                "place_blog_items": [],
             }
 
         receipt_count = None
@@ -645,8 +713,32 @@ def collect_naver_place_review_counts(merchant: dict[str, Any]) -> dict[str, Any
                 blog_count = parse_naver_count(m.group(1))
                 break
 
+        # 리뷰 날짜 후보 파싱. 공개 HTML에 노출된 날짜만 잡습니다.
+        receipt_items: list[dict[str, Any]] = []
+        date_candidates = re.findall(r'(20\d{2}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}|(?:\d{1,2})[.월]\s*(?:\d{1,2}))', merged)
+        seen_dates: set[str] = set()
+        for raw_date in date_candidates[:max_items]:
+            parsed_date = parse_korean_absolute_date(raw_date)
+            month_key = date_to_month_key(parsed_date)
+            if not parsed_date or parsed_date in seen_dates:
+                continue
+            seen_dates.add(parsed_date)
+            receipt_items.append({
+                "published_date": parsed_date,
+                "month_key": month_key,
+                "source": "naver_place_receipt",
+            })
+
+        # 블로그 리뷰 날짜는 네이버 플레이스 내 UGC 영역에서 별도 구분이 어렵기 때문에
+        # 우선 동일 HTML 내 날짜 후보 중 일부를 place_blog_items에도 제공하되, 실제 월별 배분은 count fallback을 우선 사용합니다.
+        place_blog_items: list[dict[str, Any]] = []
+
         status_value = "ok" if receipt_count is not None or blog_count is not None else "fallback"
-        reason = "네이버 플레이스 리뷰 수집 완료" if status_value == "ok" else "리뷰 카운트 파싱 실패"
+        reason = (
+            f"네이버 플레이스 리뷰 수집 완료. 날짜 후보 {len(receipt_items)}건"
+            if status_value == "ok"
+            else "리뷰 카운트 파싱 실패"
+        )
 
         return {
             "status": status_value,
@@ -654,6 +746,8 @@ def collect_naver_place_review_counts(merchant: dict[str, Any]) -> dict[str, Any
             "place_id": place_id,
             "place_receipt_count": receipt_count,
             "place_blog_count": blog_count,
+            "receipt_items": receipt_items,
+            "place_blog_items": place_blog_items,
         }
     except Exception as e:
         return {
@@ -662,6 +756,8 @@ def collect_naver_place_review_counts(merchant: dict[str, Any]) -> dict[str, Any
             "place_id": place_id,
             "place_receipt_count": None,
             "place_blog_count": None,
+            "receipt_items": [],
+            "place_blog_items": [],
         }
 
 
@@ -853,27 +949,65 @@ def make_sample_report(
             "place_id": place_review_result.get("place_id"),
         }
 
+        month_keys = [row["month_key"] for row in monthly]
+
         if naver_blog_result["status"] == "ok" and naver_blog_result["count"] is not None:
             blog_total = int(naver_blog_result["count"])
             summary["naver_blog_count"] = blog_total
-            blog_monthly = distribute_total_to_recent_months(blog_total, len(monthly))
-            for i, row in enumerate(monthly):
-                row["blog_count"] = blog_monthly[i]
+
+            blog_month_map = distribute_items_by_month(naver_blog_result.get("items", []), month_keys)
+            dated_sum = sum(blog_month_map.values())
+            undated = max(0, blog_total - dated_sum)
+
+            for row in monthly:
+                row["blog_count"] = int(blog_month_map.get(row["month_key"], 0))
+
+            # 게시일을 못 잡은 블로그는 최신월에 배정해 총량과 월별 합계가 맞도록 처리
+            if undated and monthly:
+                monthly[-1]["blog_count"] += undated
+                source_status["naver_blog"]["reason"] += f", 날짜 미확인 {undated}건은 최신월 배정"
 
         if place_review_result["status"] == "ok":
             if place_review_result.get("place_receipt_count") is not None:
                 receipt_total = int(place_review_result["place_receipt_count"])
                 summary["place_receipt_count"] = receipt_total
-                receipt_monthly = distribute_total_to_recent_months(receipt_total, len(monthly))
-                for i, row in enumerate(monthly):
-                    row["place_receipt_count"] = receipt_monthly[i]
+
+                receipt_month_map = distribute_items_by_month(place_review_result.get("receipt_items", []), month_keys)
+                dated_sum = sum(receipt_month_map.values())
+
+                # 실제 날짜 후보가 충분하지 않으면 기존 총량 기반 배분 사용
+                if dated_sum >= min(receipt_total, 5):
+                    for row in monthly:
+                        row["place_receipt_count"] = int(receipt_month_map.get(row["month_key"], 0))
+                    undated = max(0, receipt_total - dated_sum)
+                    if undated and monthly:
+                        monthly[-1]["place_receipt_count"] += undated
+                        source_status["naver_place"]["reason"] += f", 영수증 날짜 미확인 {undated}건은 최신월 배정"
+                else:
+                    receipt_monthly = distribute_total_to_recent_months(receipt_total, len(monthly))
+                    for i, row in enumerate(monthly):
+                        row["place_receipt_count"] = receipt_monthly[i]
+                    source_status["naver_place"]["reason"] += ", 영수증 월별 날짜 부족으로 총량 가중 배분"
 
             if place_review_result.get("place_blog_count") is not None:
                 place_blog_total = int(place_review_result["place_blog_count"])
                 summary["place_blog_count"] = place_blog_total
-                place_blog_monthly = distribute_total_to_recent_months(place_blog_total, len(monthly))
-                for i, row in enumerate(monthly):
-                    row["place_blog_count"] = place_blog_monthly[i]
+
+                place_blog_month_map = distribute_items_by_month(place_review_result.get("place_blog_items", []), month_keys)
+                dated_sum = sum(place_blog_month_map.values())
+
+                if dated_sum >= min(place_blog_total, 5):
+                    for row in monthly:
+                        row["place_blog_count"] = int(place_blog_month_map.get(row["month_key"], 0))
+                    undated = max(0, place_blog_total - dated_sum)
+                    if undated and monthly:
+                        monthly[-1]["place_blog_count"] += undated
+                        source_status["naver_place"]["reason"] += f", 플레이스 블로그 날짜 미확인 {undated}건은 최신월 배정"
+                else:
+                    place_blog_monthly = distribute_total_to_recent_months(place_blog_total, len(monthly))
+                    for i, row in enumerate(monthly):
+                        row["place_blog_count"] = place_blog_monthly[i]
+                    source_status["naver_place"]["reason"] += ", 플레이스 블로그 월별 날짜 부족으로 총량 가중 배분"
 
         for row in monthly:
             row["total_count"] = (
@@ -922,7 +1056,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.3.3"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.4.0"}
 
 
 @app.get("/api/health")
@@ -944,8 +1078,8 @@ def debug_login_config():
 def debug_source_config():
     return {
         "youtube_collection_mode": "html_scrape_strict_with_published_month_v5_allocate_undated",
-        "naver_blog_collection_mode": "html_scrape",
-        "naver_place_review_collection_mode": "mobile_html_scrape",
+        "naver_blog_collection_mode": "html_scrape_with_post_date",
+        "naver_place_review_collection_mode": "mobile_html_scrape_with_date_attempt",
         "youtube_api_key_required": False,
     }
 
