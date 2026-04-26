@@ -1,8 +1,10 @@
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
+from html import unescape
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
@@ -12,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.1.0")
+app = FastAPI(title="AI매출업 리포트 API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,8 +31,6 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "4858").strip()
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "ai-report-secret-2026").strip()
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = 720
-
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
 
 class LoginRequest(BaseModel):
@@ -131,9 +131,7 @@ REPORTS: dict[str, dict[str, Any]] = {}
 
 
 def get_period_label(period: str = "최근 6개월", start_date: str | None = None, end_date: str | None = None) -> str:
-    if period == "custom":
-        return f"{start_date} ~ {end_date}" if start_date and end_date else "기간 설정"
-    if period == "기간 설정":
+    if period in ("custom", "기간 설정"):
         return f"{start_date} ~ {end_date}" if start_date and end_date else "기간 설정"
     return period
 
@@ -156,95 +154,99 @@ def split_keywords(value: str | list[str] | None) -> list[str]:
     return [v.strip() for v in str(value).split(",") if v.strip()]
 
 
-def http_get_json(url: str) -> dict[str, Any]:
-    req = Request(url, headers={"User-Agent": "ai-report-api/1.1"})
-    with urlopen(req, timeout=12) as response:
-        return json.loads(response.read().decode("utf-8"))
+def fetch_text(url: str) -> str:
+    req = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+    )
+    with urlopen(req, timeout=15) as response:
+        return response.read().decode("utf-8", errors="ignore")
 
 
-def collect_youtube_data(merchant: dict[str, Any], max_results: int = 5) -> dict[str, Any]:
+def parse_compact_view_count(text: str) -> int:
+    if not text:
+        return 0
+    raw = text.replace("조회수", "").replace("views", "").replace(",", "").replace(" ", "").strip()
+    m = re.search(r"(\d+(?:\.\d+)?)(만|천|K|M)?", raw, re.IGNORECASE)
+    if not m:
+        return 0
+    num = float(m.group(1))
+    unit = (m.group(2) or "").lower()
+    if unit == "만":
+        num *= 10000
+    elif unit == "천":
+        num *= 1000
+    elif unit == "k":
+        num *= 1000
+    elif unit == "m":
+        num *= 1000000
+    return int(num)
+
+
+def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 8) -> dict[str, Any]:
     """
-    YouTube Data API v3 기반 실제 수집.
-    YOUTUBE_API_KEY가 없거나 API 오류가 나면 status가 fallback으로 반환됩니다.
+    YouTube 검색결과 HTML에서 videoId/title/channel/viewCount를 추출하는 비공식 수집.
+    YouTube 구조 변경·차단 시 fallback 처리됩니다.
     """
-    if not YOUTUBE_API_KEY:
-        return {
-            "status": "fallback",
-            "reason": "YOUTUBE_API_KEY 미설정",
-            "youtube_count": None,
-            "youtube_total_views": None,
-            "top_videos": [],
-        }
-
     keywords = split_keywords(merchant.get("youtube_keywords")) or [merchant["name"]]
-    video_map: dict[str, dict[str, Any]] = {}
+    videos: dict[str, dict[str, Any]] = {}
 
     try:
         for keyword in keywords:
-            search_params = urlencode({
-                "part": "snippet",
-                "q": keyword,
-                "type": "video",
-                "maxResults": max_results,
-                "order": "relevance",
-                "regionCode": "KR",
-                "key": YOUTUBE_API_KEY,
-            })
-            search_url = f"https://www.googleapis.com/youtube/v3/search?{search_params}"
-            search_data = http_get_json(search_url)
+            url = f"https://www.youtube.com/results?search_query={quote_plus(keyword)}"
+            html = fetch_text(url)
 
-            for item in search_data.get("items", []):
-                video_id = item.get("id", {}).get("videoId")
-                snippet = item.get("snippet", {})
-                if not video_id:
+            # 1차: HTML 내 JSON 조각에서 videoRenderer 단위 추출
+            video_ids = re.findall(r'"videoId":"([^"]{8,20})"', html)
+            titles = re.findall(r'"title":\{"runs":\[\{"text":"(.*?)"\}\]', html)
+            channels = re.findall(r'"ownerText":\{"runs":\[\{"text":"(.*?)"', html)
+            views = re.findall(r'"viewCountText":\{"simpleText":"(.*?)"\}', html)
+
+            for idx, video_id in enumerate(video_ids):
+                if video_id in videos:
                     continue
-                video_map[video_id] = {
+                title = unescape(titles[idx]) if idx < len(titles) else f"{keyword} 관련 영상"
+                channel = unescape(channels[idx]) if idx < len(channels) else "YouTube"
+                view_text = unescape(views[idx]) if idx < len(views) else ""
+                videos[video_id] = {
                     "video_id": video_id,
-                    "title": snippet.get("title", ""),
-                    "channel": snippet.get("channelTitle", ""),
-                    "published_at": snippet.get("publishedAt", ""),
-                    "views": 0,
+                    "title": title,
+                    "channel": channel,
+                    "views": parse_compact_view_count(view_text),
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
                 }
+                if len(videos) >= max_results:
+                    break
 
-        if not video_map:
-            return {
-                "status": "ok",
-                "reason": "검색 결과 없음",
-                "youtube_count": 0,
-                "youtube_total_views": 0,
-                "top_videos": [],
-            }
+            if len(videos) >= max_results:
+                break
 
-        ids = ",".join(video_map.keys())
-        videos_params = urlencode({
-            "part": "statistics,snippet",
-            "id": ids,
-            "key": YOUTUBE_API_KEY,
-        })
-        videos_url = f"https://www.googleapis.com/youtube/v3/videos?{videos_params}"
-        videos_data = http_get_json(videos_url)
+        top_videos = sorted(videos.values(), key=lambda x: x["views"], reverse=True)[:5]
 
-        for item in videos_data.get("items", []):
-            video_id = item.get("id")
-            stats = item.get("statistics", {})
-            if video_id in video_map:
-                video_map[video_id]["views"] = int(stats.get("viewCount", 0))
-
-        top_videos = sorted(video_map.values(), key=lambda x: x["views"], reverse=True)[:5]
         return {
-            "status": "ok",
-            "reason": "",
-            "youtube_count": len(video_map),
-            "youtube_total_views": sum(v["views"] for v in video_map.values()),
+            "status": "ok" if videos else "fallback",
+            "reason": "" if videos else "YouTube 검색 결과 파싱 실패 또는 결과 없음",
+            "youtube_count": len(videos),
+            "youtube_total_views": sum(v["views"] for v in videos.values()),
             "top_videos": [
-                {"title": v["title"], "channel": v["channel"], "views": v["views"]}
+                {
+                    "title": v["title"],
+                    "channel": v["channel"],
+                    "views": v["views"],
+                }
                 for v in top_videos
             ],
         }
     except Exception as e:
         return {
             "status": "fallback",
-            "reason": f"YouTube API 오류: {str(e)[:120]}",
+            "reason": f"YouTube 비공식 크롤링 오류: {str(e)[:140]}",
             "youtube_count": None,
             "youtube_total_views": None,
             "top_videos": [],
@@ -341,11 +343,19 @@ def make_sample_report(
         "youtube": {
             "status": "sample",
             "reason": "수집 전 샘플 데이터",
-        }
+        },
+        "naver_blog": {
+            "status": "sample",
+            "reason": "다음 단계 구현 예정",
+        },
+        "instagram": {
+            "status": "sample",
+            "reason": "다음 단계 구현 예정",
+        },
     }
 
     if use_live_youtube:
-        youtube_result = collect_youtube_data(merchant)
+        youtube_result = collect_youtube_search_scrape(merchant)
         source_status["youtube"] = {
             "status": youtube_result["status"],
             "reason": youtube_result["reason"],
@@ -394,7 +404,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.1.0"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.2.0"}
 
 
 @app.get("/api/health")
@@ -415,8 +425,8 @@ def debug_login_config():
 @app.get("/api/debug-source-config")
 def debug_source_config():
     return {
-        "youtube_api_key_set": bool(YOUTUBE_API_KEY),
-        "youtube_api_key_length": len(YOUTUBE_API_KEY),
+        "youtube_collection_mode": "html_scrape",
+        "youtube_api_key_required": False,
     }
 
 
