@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.3.0")
+app = FastAPI(title="AI매출업 리포트 API", version="1.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -720,17 +720,31 @@ def make_sample_report(
     }
 
     if use_live_youtube:
+        # 실제 수집 모드에서는 샘플 유튜브 월별값을 먼저 전부 0으로 초기화합니다.
+        # 그래야 정확 매칭 영상이 없을 때 월별 유튜브가 2,2,2처럼 남지 않습니다.
+        for row in monthly:
+            row["youtube_count"] = 0
+            row["total_count"] = (
+                row["blog_count"]
+                + row["instagram_count"]
+                + row["place_receipt_count"]
+                + row["place_blog_count"]
+            )
+
+        youtube_count = 0
+        summary["youtube_total_views"] = 0
+        top_videos = []
+
         youtube_result = collect_youtube_search_scrape(merchant)
         source_status["youtube"] = {
             "status": youtube_result["status"],
             "reason": youtube_result["reason"],
         }
-        if youtube_result["status"] == "ok":
-            youtube_count = youtube_result["youtube_count"] or 0
-            summary["youtube_total_views"] = youtube_result["youtube_total_views"] or 0
 
+        if youtube_result["status"] == "ok":
+            summary["youtube_total_views"] = youtube_result["youtube_total_views"] or 0
             monthly_youtube_counts = youtube_result.get("monthly_youtube_counts", {})
-            youtube_count = 0
+
             for row in monthly:
                 matched_count = int(monthly_youtube_counts.get(row["month_key"], 0))
                 row["youtube_count"] = matched_count
@@ -830,7 +844,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.3.0"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.3.1"}
 
 
 @app.get("/api/health")
