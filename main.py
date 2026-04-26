@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from __future__ import annotations
 
 import os
@@ -125,8 +126,20 @@ MERCHANTS = [
 
 REPORTS: dict[str, dict[str, Any]] = {}
 
+def get_period_label(period: str = "최근 6개월", start_date: str | None = None, end_date: str | None = None) -> str:
+    if period == "기간 설정":
+        if start_date and end_date:
+            return f"{start_date} ~ {end_date}"
+        return "기간 설정"
 
-def make_sample_report(merchant: dict[str, Any]) -> dict[str, Any]:
+    return period
+
+def make_sample_report(
+    merchant: dict[str, Any],
+    period: str = "최근 6개월",
+    start_date: str | None = None,
+    end_date: str | None = None
+) -> dict[str, Any]:
     name = merchant["name"]
 
     sample_data = {
@@ -178,10 +191,16 @@ def make_sample_report(merchant: dict[str, Any]) -> dict[str, Any]:
     ]
 
     return {
-        "merchant_name": merchant["name"],
-        "region": merchant.get("region", ""),
-        "generated_at": now_text(),
-        "summary": summary,
+    "merchant_name": merchant["name"],
+    "region": merchant.get("region", ""),
+    "generated_at": now_text(),
+
+    "period": period,
+    "start_date": start_date,
+    "end_date": end_date,
+    "period_label": get_period_label(period, start_date, end_date),
+
+    "summary": summary,
         "monthly_summary": monthly,
         "channel_share": [
             {"name": "네이버 블로그", "value": summary["naver_blog_count"]},
@@ -245,7 +264,34 @@ def list_merchants(admin: str = Depends(verify_token)):
 
 
 @app.get("/api/reports/{merchant_id}")
-def get_report(merchant_id: str, period: str = "최근 6개월", admin: str = Depends(verify_token)):
+def get_report(
+    merchant_id: str,
+    period: str = "최근 6개월",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    admin: str = Depends(verify_token)
+):
+    if merchant_id not in REPORTS:
+        merchant = next((m for m in MERCHANTS if m["id"] == merchant_id), None)
+
+        if not merchant:
+            raise HTTPException(status_code=404, detail="가맹점을 찾을 수 없습니다.")
+
+        REPORTS[merchant_id] = make_sample_report(
+            merchant,
+            period=period,
+            start_date=start_date,
+            end_date=end_date
+        )
+
+    report = REPORTS[merchant_id]
+    report["period"] = period
+    report["start_date"] = start_date
+    report["end_date"] = end_date
+    report["period_label"] = get_period_label(period, start_date, end_date)
+
+    return report
+    
     if merchant_id not in REPORTS:
         merchant = next((m for m in MERCHANTS if m["id"] == merchant_id), None)
         if not merchant:
