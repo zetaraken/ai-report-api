@@ -13,15 +13,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+# 1️⃣ 먼저 app 생성
+app = FastAPI()
+
+# 2️⃣ 그 다음 CORS 설정
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 개발 단계
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 테스트용
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
 
 app = FastAPI(title="AI매출업 리포트 API", version="1.6.0")
 
