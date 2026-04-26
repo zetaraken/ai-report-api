@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.4.0")
+app = FastAPI(title="AI매출업 리포트 API", version="1.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -639,10 +639,170 @@ def collect_naver_blog_search(merchant: dict[str, Any], max_results: int = 50) -
         }
 
 
-def collect_naver_place_review_counts(merchant: dict[str, Any], max_items: int = 80) -> dict[str, Any]:
+def extract_review_counts_from_text(page_text: str) -> tuple[int | None, int | None]:
+    receipt_count = None
+    blog_count = None
+
+    receipt_patterns = [
+        r"방문자\s*리뷰\s*([0-9,]+)",
+        r"방문자리뷰\s*([0-9,]+)",
+        r"영수증\s*리뷰\s*([0-9,]+)",
+        r"영수증리뷰\s*([0-9,]+)",
+    ]
+    blog_patterns = [
+        r"블로그\s*리뷰\s*([0-9,]+)",
+        r"블로그리뷰\s*([0-9,]+)",
+    ]
+
+    for pattern in receipt_patterns:
+        m = re.search(pattern, page_text)
+        if m:
+            receipt_count = parse_naver_count(m.group(1))
+            break
+
+    for pattern in blog_patterns:
+        m = re.search(pattern, page_text)
+        if m:
+            blog_count = parse_naver_count(m.group(1))
+            break
+
+    return receipt_count, blog_count
+
+
+def extract_dates_from_text(page_text: str, max_items: int = 300) -> list[dict[str, Any]]:
+    dates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    patterns = [
+        r"20\d{2}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}",
+        r"\d{1,2}[.월]\s*\d{1,2}",
+    ]
+
+    for pattern in patterns:
+        for m in re.finditer(pattern, page_text):
+            raw = m.group(0)
+            parsed = parse_korean_absolute_date(raw)
+            month_key = date_to_month_key(parsed)
+            if not parsed or parsed in seen:
+                continue
+            seen.add(parsed)
+            dates.append({
+                "published_date": parsed,
+                "month_key": month_key,
+                "source": "naver_place_receipt",
+            })
+            if len(dates) >= max_items:
+                return dates
+
+    return dates
+
+
+def crawl_naver_place_with_playwright(place_id: str, max_clicks: int = 35) -> dict[str, Any]:
     """
-    네이버 플레이스 모바일 페이지에서 방문자 리뷰/블로그 리뷰 카운트와 일부 리뷰 날짜를 추출하는 비공식 수집.
-    v2: 가능한 경우 리뷰 본문 주변 날짜를 파싱해 월별 배분에 사용합니다.
+    네이버 플레이스는 JS 렌더링/무한스크롤 구조라 단순 requests HTML 파싱이 부정확합니다.
+    이 함수는 Playwright로 실제 모바일 페이지를 열고 더보기/스크롤 후 화면 텍스트에서 카운트와 날짜를 수집합니다.
+    Railway에 playwright 및 chromium 설치가 필요합니다.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        return {
+            "status": "fallback",
+            "reason": f"Playwright 미설치 또는 import 실패: {str(e)[:120]}",
+            "place_receipt_count": None,
+            "place_blog_count": None,
+            "receipt_items": [],
+            "place_blog_items": [],
+        }
+
+    urls = [
+        f"https://m.place.naver.com/restaurant/{place_id}/review/visitor",
+        f"https://m.place.naver.com/place/{place_id}/review/visitor",
+    ]
+
+    last_error = ""
+    for url in urls:
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                    ],
+                )
+                page = browser.new_page(
+                    viewport={"width": 390, "height": 1200},
+                    user_agent=(
+                        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+                    ),
+                    locale="ko-KR",
+                )
+                page.goto(url, wait_until="networkidle", timeout=25000)
+                page.wait_for_timeout(1500)
+
+                # 리뷰 더보기/스크롤 반복
+                for _ in range(max_clicks):
+                    page.mouse.wheel(0, 1800)
+                    page.wait_for_timeout(450)
+
+                    more_candidates = [
+                        "text=더보기",
+                        "text=리뷰 더보기",
+                        "text=펼쳐보기",
+                        "button:has-text('더보기')",
+                    ]
+                    clicked = False
+                    for selector in more_candidates:
+                        try:
+                            loc = page.locator(selector).last
+                            if loc.count() > 0 and loc.is_visible():
+                                loc.click(timeout=800)
+                                page.wait_for_timeout(700)
+                                clicked = True
+                                break
+                        except Exception:
+                            continue
+
+                    if not clicked:
+                        # 무한 스크롤만으로 로딩되는 경우를 위해 계속 진행
+                        continue
+
+                page_text = page.inner_text("body", timeout=10000)
+                browser.close()
+
+                receipt_count, blog_count = extract_review_counts_from_text(page_text)
+                receipt_items = extract_dates_from_text(page_text)
+
+                return {
+                    "status": "ok",
+                    "reason": f"Playwright 모바일 리뷰 페이지 수집 완료. 날짜 후보 {len(receipt_items)}건",
+                    "place_receipt_count": receipt_count,
+                    "place_blog_count": blog_count,
+                    "receipt_items": receipt_items,
+                    "place_blog_items": [],
+                }
+        except Exception as e:
+            last_error = str(e)[:180]
+            continue
+
+    return {
+        "status": "fallback",
+        "reason": f"Playwright 네이버 플레이스 수집 실패: {last_error}",
+        "place_receipt_count": None,
+        "place_blog_count": None,
+        "receipt_items": [],
+        "place_blog_items": [],
+    }
+
+
+def collect_naver_place_review_counts(merchant: dict[str, Any], max_items: int = 300) -> dict[str, Any]:
+    """
+    네이버 플레이스 리뷰 수집 v3.
+    1순위: Playwright 브라우저 기반 실제 페이지 수집
+    2순위: 실패 시 기존 requests HTML 파싱 fallback
     """
     place_url = merchant.get("naver_place_url", "")
     place_id = extract_naver_place_id(place_url)
@@ -657,6 +817,11 @@ def collect_naver_place_review_counts(merchant: dict[str, Any], max_items: int =
             "receipt_items": [],
             "place_blog_items": [],
         }
+
+    pw_result = crawl_naver_place_with_playwright(place_id, max_clicks=45)
+    if pw_result["status"] == "ok":
+        pw_result["place_id"] = place_id
+        return pw_result
 
     candidate_urls = [
         f"https://m.place.naver.com/restaurant/{place_id}/home",
@@ -678,7 +843,7 @@ def collect_naver_place_review_counts(merchant: dict[str, Any], max_items: int =
         if not merged.strip():
             return {
                 "status": "fallback",
-                "reason": "네이버 플레이스 페이지 접근 실패",
+                "reason": pw_result["reason"] + " / requests 페이지 접근 실패",
                 "place_id": place_id,
                 "place_receipt_count": None,
                 "place_blog_count": None,
@@ -686,56 +851,26 @@ def collect_naver_place_review_counts(merchant: dict[str, Any], max_items: int =
                 "place_blog_items": [],
             }
 
-        receipt_count = None
-        blog_count = None
+        receipt_count, blog_count = extract_review_counts_from_text(strip_html(merged))
 
-        receipt_patterns = [
-            r"방문자\s*리뷰\s*([0-9,]+)",
-            r"방문자리뷰\s*([0-9,]+)",
-            r'"visitorReviewCount"\s*:\s*([0-9]+)',
-            r'"reviewCount"\s*:\s*([0-9]+)',
-        ]
-        blog_patterns = [
-            r"블로그\s*리뷰\s*([0-9,]+)",
-            r"블로그리뷰\s*([0-9,]+)",
-            r'"blogReviewCount"\s*:\s*([0-9]+)',
-        ]
+        # JSON/HTML에서 카운트 추가 보정
+        if receipt_count is None:
+            for pattern in [r'"visitorReviewCount"\s*:\s*([0-9]+)', r'"reviewCount"\s*:\s*([0-9]+)']:
+                m = re.search(pattern, merged)
+                if m:
+                    receipt_count = parse_naver_count(m.group(1))
+                    break
 
-        for pattern in receipt_patterns:
-            m = re.search(pattern, merged)
-            if m:
-                receipt_count = parse_naver_count(m.group(1))
-                break
-
-        for pattern in blog_patterns:
-            m = re.search(pattern, merged)
+        if blog_count is None:
+            m = re.search(r'"blogReviewCount"\s*:\s*([0-9]+)', merged)
             if m:
                 blog_count = parse_naver_count(m.group(1))
-                break
 
-        # 리뷰 날짜 후보 파싱. 공개 HTML에 노출된 날짜만 잡습니다.
-        receipt_items: list[dict[str, Any]] = []
-        date_candidates = re.findall(r'(20\d{2}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}|(?:\d{1,2})[.월]\s*(?:\d{1,2}))', merged)
-        seen_dates: set[str] = set()
-        for raw_date in date_candidates[:max_items]:
-            parsed_date = parse_korean_absolute_date(raw_date)
-            month_key = date_to_month_key(parsed_date)
-            if not parsed_date or parsed_date in seen_dates:
-                continue
-            seen_dates.add(parsed_date)
-            receipt_items.append({
-                "published_date": parsed_date,
-                "month_key": month_key,
-                "source": "naver_place_receipt",
-            })
-
-        # 블로그 리뷰 날짜는 네이버 플레이스 내 UGC 영역에서 별도 구분이 어렵기 때문에
-        # 우선 동일 HTML 내 날짜 후보 중 일부를 place_blog_items에도 제공하되, 실제 월별 배분은 count fallback을 우선 사용합니다.
-        place_blog_items: list[dict[str, Any]] = []
+        receipt_items = extract_dates_from_text(strip_html(merged), max_items=max_items)
 
         status_value = "ok" if receipt_count is not None or blog_count is not None else "fallback"
         reason = (
-            f"네이버 플레이스 리뷰 수집 완료. 날짜 후보 {len(receipt_items)}건"
+            f"requests HTML fallback 수집 완료. Playwright 실패 사유: {pw_result['reason']}. 날짜 후보 {len(receipt_items)}건"
             if status_value == "ok"
             else "리뷰 카운트 파싱 실패"
         )
@@ -747,7 +882,7 @@ def collect_naver_place_review_counts(merchant: dict[str, Any], max_items: int =
             "place_receipt_count": receipt_count,
             "place_blog_count": blog_count,
             "receipt_items": receipt_items,
-            "place_blog_items": place_blog_items,
+            "place_blog_items": [],
         }
     except Exception as e:
         return {
@@ -975,8 +1110,9 @@ def make_sample_report(
                 receipt_month_map = distribute_items_by_month(place_review_result.get("receipt_items", []), month_keys)
                 dated_sum = sum(receipt_month_map.values())
 
-                # 실제 날짜 후보가 충분하지 않으면 기존 총량 기반 배분 사용
-                if dated_sum >= min(receipt_total, 5):
+                # 날짜 후보가 1건 이상 있으면 실제 날짜 기반으로 배분하고, 나머지는 최신월에 배정합니다.
+                # 날짜 후보가 0건일 때만 총량 가중 배분을 사용합니다.
+                if dated_sum > 0:
                     for row in monthly:
                         row["place_receipt_count"] = int(receipt_month_map.get(row["month_key"], 0))
                     undated = max(0, receipt_total - dated_sum)
@@ -1056,7 +1192,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.4.0"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.5.0"}
 
 
 @app.get("/api/health")
@@ -1079,7 +1215,7 @@ def debug_source_config():
     return {
         "youtube_collection_mode": "html_scrape_strict_with_published_month_v5_allocate_undated",
         "naver_blog_collection_mode": "html_scrape_with_post_date",
-        "naver_place_review_collection_mode": "mobile_html_scrape_with_date_attempt",
+        "naver_place_review_collection_mode": "playwright_mobile_review_page_with_html_fallback",
         "youtube_api_key_required": False,
     }
 
