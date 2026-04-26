@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.3.2")
+app = FastAPI(title="AI매출업 리포트 API", version="1.3.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -428,6 +428,7 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 1
                 "youtube_count": 0,
                 "youtube_total_views": 0,
                 "monthly_youtube_counts": {},
+                "undated_count": 0,
                 "top_videos": [],
             }
 
@@ -437,6 +438,7 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 1
             "youtube_count": len(videos),
             "youtube_total_views": sum(v["views"] for v in videos.values()),
             "monthly_youtube_counts": monthly_counts,
+            "undated_count": undated_count,
             "top_videos": [
                 {
                     "title": v["title"],
@@ -454,6 +456,7 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 1
             "youtube_count": None,
             "youtube_total_views": None,
             "monthly_youtube_counts": {},
+            "undated_count": 0,
             "top_videos": [],
         }
 
@@ -810,6 +813,7 @@ def make_sample_report(
         if youtube_result["status"] == "ok":
             summary["youtube_total_views"] = youtube_result["youtube_total_views"] or 0
             monthly_youtube_counts = youtube_result.get("monthly_youtube_counts", {})
+            undated_count = int(youtube_result.get("undated_count", 0) or 0)
 
             for row in monthly:
                 matched_count = int(monthly_youtube_counts.get(row["month_key"], 0))
@@ -822,6 +826,14 @@ def make_sample_report(
                     + row["youtube_count"]
                 )
                 youtube_count += matched_count
+
+            # YouTube 검색 HTML에서 업로드일을 제공하지 않는 Shorts/영상은
+            # 월별 표에서 누락되지 않도록 선택 기간의 최신 월에 배정합니다.
+            if undated_count > 0 and monthly:
+                monthly[-1]["youtube_count"] += undated_count
+                monthly[-1]["total_count"] += undated_count
+                youtube_count += undated_count
+                source_status["youtube"]["reason"] += f", 날짜 미확인 {undated_count}건은 최신월에 배정"
 
             if youtube_result["top_videos"]:
                 top_videos = youtube_result["top_videos"]
@@ -910,7 +922,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.3.2"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.3.3"}
 
 
 @app.get("/api/health")
@@ -931,7 +943,7 @@ def debug_login_config():
 @app.get("/api/debug-source-config")
 def debug_source_config():
     return {
-        "youtube_collection_mode": "html_scrape_strict_with_published_month_v4_no_fake_titles",
+        "youtube_collection_mode": "html_scrape_strict_with_published_month_v5_allocate_undated",
         "naver_blog_collection_mode": "html_scrape",
         "naver_place_review_collection_mode": "mobile_html_scrape",
         "youtube_api_key_required": False,
