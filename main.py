@@ -4,8 +4,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from html import unescape
 from typing import Any
-from urllib.parse import quote_plus
-from urllib.request import Request, urlopen
+from urllib.parse import quote_plus, urlparse
+from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.2.2")
+app = FastAPI(title="AI매출업 리포트 API", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -392,6 +392,229 @@ def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 1
         }
 
 
+def resolve_final_url(url: str) -> str:
+    try:
+        opener = build_opener(HTTPRedirectHandler)
+        req = Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                ),
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+        )
+        response = opener.open(req, timeout=12)
+        return response.geturl()
+    except Exception:
+        return url
+
+
+def extract_naver_place_id(naver_place_url: str) -> str | None:
+    final_url = resolve_final_url(naver_place_url)
+
+    patterns = [
+        r"/place/(\d+)",
+        r"/restaurant/(\d+)",
+        r"placeId=(\d+)",
+        r"id=(\d+)",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, final_url)
+        if m:
+            return m.group(1)
+
+    return None
+
+
+def parse_naver_count(text: str) -> int:
+    if not text:
+        return 0
+
+    cleaned = text.replace(",", "").replace(" ", "")
+    m = re.search(r"(\d+)", cleaned)
+    return int(m.group(1)) if m else 0
+
+
+def collect_naver_blog_search(merchant: dict[str, Any], max_results: int = 30) -> dict[str, Any]:
+    """
+    네이버 블로그 검색 HTML 기반 비공식 수집.
+    검색결과 HTML 구조 변경 시 fallback 처리됩니다.
+    """
+    keywords = split_keywords(merchant.get("blog_keywords")) or [merchant["name"]]
+    posts: dict[str, dict[str, Any]] = {}
+    raw_candidates = 0
+    filtered_out = 0
+
+    try:
+        for keyword in keywords:
+            url = f"https://search.naver.com/search.naver?where=blog&query={quote_plus(keyword)}"
+            html = fetch_text(url)
+
+            # 네이버 검색결과의 블로그 링크 후보
+            links = re.findall(r'href="(https://blog\.naver\.com/[^"]+)"', html)
+            titles = re.findall(r'<a[^>]+class="[^"]*(?:title_link|api_txt_lines)[^"]*"[^>]*>(.*?)</a>', html, re.S)
+
+            for i, link in enumerate(links):
+                raw_candidates += 1
+                if link in posts:
+                    continue
+
+                title_html = titles[i] if i < len(titles) else ""
+                title = re.sub(r"<.*?>", "", title_html)
+                title = unescape(title).strip()
+
+                combined = normalize_text(title + " " + link)
+                merchant_name = normalize_text(merchant["name"])
+
+                # 매장명 또는 등록 검색어 전체 문구가 포함되어야 인정
+                relevant = merchant_name in combined if merchant_name else False
+                if not relevant:
+                    for keyword_check in keywords:
+                        if normalize_text(keyword_check) in combined:
+                            relevant = True
+                            break
+
+                if not relevant:
+                    filtered_out += 1
+                    continue
+
+                posts[link] = {
+                    "title": title or merchant["name"] + " 관련 블로그",
+                    "url": link,
+                    "source": "naver_blog",
+                }
+
+                if len(posts) >= max_results:
+                    break
+
+            if len(posts) >= max_results:
+                break
+
+        return {
+            "status": "ok",
+            "reason": f"네이버 블로그 검색 수집. 후보 {raw_candidates}건 중 {filtered_out}건 제외",
+            "count": len(posts),
+            "items": list(posts.values())[:10],
+        }
+    except Exception as e:
+        return {
+            "status": "fallback",
+            "reason": f"네이버 블로그 수집 오류: {str(e)[:140]}",
+            "count": None,
+            "items": [],
+        }
+
+
+def collect_naver_place_review_counts(merchant: dict[str, Any]) -> dict[str, Any]:
+    """
+    네이버 플레이스 모바일 페이지에서 방문자 리뷰/블로그 리뷰 카운트를 추출하는 비공식 수집.
+    naver.me 단축 URL은 최종 URL로 resolve 후 place id를 추정합니다.
+    """
+    place_url = merchant.get("naver_place_url", "")
+    place_id = extract_naver_place_id(place_url)
+
+    if not place_id:
+        return {
+            "status": "fallback",
+            "reason": "네이버 플레이스 ID 추출 실패",
+            "place_id": None,
+            "place_receipt_count": None,
+            "place_blog_count": None,
+        }
+
+    candidate_urls = [
+        f"https://m.place.naver.com/restaurant/{place_id}/home",
+        f"https://m.place.naver.com/place/{place_id}/home",
+        f"https://m.place.naver.com/restaurant/{place_id}/review/visitor",
+        f"https://m.place.naver.com/place/{place_id}/review/visitor",
+    ]
+
+    try:
+        merged = ""
+        for url in candidate_urls:
+            try:
+                merged += "\n" + fetch_text(url)
+            except Exception:
+                continue
+
+        if not merged.strip():
+            return {
+                "status": "fallback",
+                "reason": "네이버 플레이스 페이지 접근 실패",
+                "place_id": place_id,
+                "place_receipt_count": None,
+                "place_blog_count": None,
+            }
+
+        receipt_count = None
+        blog_count = None
+
+        receipt_patterns = [
+            r"방문자\s*리뷰\s*([0-9,]+)",
+            r"방문자리뷰\s*([0-9,]+)",
+            r'"visitorReviewCount"\s*:\s*([0-9]+)',
+            r'"reviewCount"\s*:\s*([0-9]+)',
+        ]
+        blog_patterns = [
+            r"블로그\s*리뷰\s*([0-9,]+)",
+            r"블로그리뷰\s*([0-9,]+)",
+            r'"blogReviewCount"\s*:\s*([0-9]+)',
+        ]
+
+        for pattern in receipt_patterns:
+            m = re.search(pattern, merged)
+            if m:
+                receipt_count = parse_naver_count(m.group(1))
+                break
+
+        for pattern in blog_patterns:
+            m = re.search(pattern, merged)
+            if m:
+                blog_count = parse_naver_count(m.group(1))
+                break
+
+        status_value = "ok" if receipt_count is not None or blog_count is not None else "fallback"
+        reason = "네이버 플레이스 리뷰 수집 완료" if status_value == "ok" else "리뷰 카운트 파싱 실패"
+
+        return {
+            "status": status_value,
+            "reason": reason,
+            "place_id": place_id,
+            "place_receipt_count": receipt_count,
+            "place_blog_count": blog_count,
+        }
+    except Exception as e:
+        return {
+            "status": "fallback",
+            "reason": f"네이버 플레이스 리뷰 수집 오류: {str(e)[:140]}",
+            "place_id": place_id,
+            "place_receipt_count": None,
+            "place_blog_count": None,
+        }
+
+
+def distribute_total_to_recent_months(total: int, month_count: int) -> list[int]:
+    """
+    실제 월별 게시일을 안정적으로 확보하지 못하는 채널의 임시 배분 로직.
+    총량은 실제 수집값을 쓰고, 월별은 최근월 가중치로 분배합니다.
+    """
+    if month_count <= 0:
+        return []
+
+    if total <= 0:
+        return [0] * month_count
+
+    weights = list(range(1, month_count + 1))
+    weight_sum = sum(weights)
+    values = [int(total * w / weight_sum) for w in weights]
+    diff = total - sum(values)
+    values[-1] += diff
+    return values
+
+
 def make_base_sample_data(name: str) -> dict[str, Any]:
     sample_data = {
         "배포차": {
@@ -441,6 +664,7 @@ def make_sample_report(
     start_date: str | None = None,
     end_date: str | None = None,
     use_live_youtube: bool = False,
+    use_live_naver: bool = False,
 ) -> dict[str, Any]:
     name = merchant["name"]
     data = make_base_sample_data(name)
@@ -522,6 +746,52 @@ def make_sample_report(
             if youtube_result["top_videos"]:
                 top_videos = youtube_result["top_videos"]
 
+    if use_live_naver:
+        naver_blog_result = collect_naver_blog_search(merchant)
+        place_review_result = collect_naver_place_review_counts(merchant)
+
+        source_status["naver_blog"] = {
+            "status": naver_blog_result["status"],
+            "reason": naver_blog_result["reason"],
+            "items": naver_blog_result.get("items", []),
+        }
+        source_status["naver_place"] = {
+            "status": place_review_result["status"],
+            "reason": place_review_result["reason"],
+            "place_id": place_review_result.get("place_id"),
+        }
+
+        if naver_blog_result["status"] == "ok" and naver_blog_result["count"] is not None:
+            blog_total = int(naver_blog_result["count"])
+            summary["naver_blog_count"] = blog_total
+            blog_monthly = distribute_total_to_recent_months(blog_total, len(monthly))
+            for i, row in enumerate(monthly):
+                row["blog_count"] = blog_monthly[i]
+
+        if place_review_result["status"] == "ok":
+            if place_review_result.get("place_receipt_count") is not None:
+                receipt_total = int(place_review_result["place_receipt_count"])
+                summary["place_receipt_count"] = receipt_total
+                receipt_monthly = distribute_total_to_recent_months(receipt_total, len(monthly))
+                for i, row in enumerate(monthly):
+                    row["place_receipt_count"] = receipt_monthly[i]
+
+            if place_review_result.get("place_blog_count") is not None:
+                place_blog_total = int(place_review_result["place_blog_count"])
+                summary["place_blog_count"] = place_blog_total
+                place_blog_monthly = distribute_total_to_recent_months(place_blog_total, len(monthly))
+                for i, row in enumerate(monthly):
+                    row["place_blog_count"] = place_blog_monthly[i]
+
+        for row in monthly:
+            row["total_count"] = (
+                row["blog_count"]
+                + row["instagram_count"]
+                + row["place_receipt_count"]
+                + row["place_blog_count"]
+                + row["youtube_count"]
+            )
+
     summary["total_mentions"] = (
         summary["naver_blog_count"]
         + summary["instagram_count"]
@@ -560,7 +830,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.2.2"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.3.0"}
 
 
 @app.get("/api/health")
@@ -582,6 +852,8 @@ def debug_login_config():
 def debug_source_config():
     return {
         "youtube_collection_mode": "html_scrape_strict_with_published_month",
+        "naver_blog_collection_mode": "html_scrape",
+        "naver_place_review_collection_mode": "mobile_html_scrape",
         "youtube_api_key_required": False,
     }
 
@@ -655,6 +927,7 @@ def create_crawl_job(payload: CrawlJobCreate, admin: str = Depends(verify_token)
         start_date=payload.start_date,
         end_date=payload.end_date,
         use_live_youtube=True,
+        use_live_naver=True,
     )
 
     return {
