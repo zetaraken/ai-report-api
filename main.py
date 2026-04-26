@@ -127,24 +127,55 @@ REPORTS: dict[str, dict[str, Any]] = {}
 
 
 def make_sample_report(merchant: dict[str, Any]) -> dict[str, Any]:
-    if merchant["name"] == "온빈 신정호":
-        monthly = [
-            {"month": "1월", "blog_count": 11, "instagram_count": 19, "place_receipt_count": 6, "place_blog_count": 2, "youtube_count": 2, "total_count": 40},
-            {"month": "2월", "blog_count": 14, "instagram_count": 22, "place_receipt_count": 7, "place_blog_count": 3, "youtube_count": 2, "total_count": 48},
-            {"month": "3월", "blog_count": 18, "instagram_count": 24, "place_receipt_count": 8, "place_blog_count": 3, "youtube_count": 3, "total_count": 56},
-            {"month": "4월", "blog_count": 23, "instagram_count": 29, "place_receipt_count": 10, "place_blog_count": 4, "youtube_count": 4, "total_count": 70},
-        ]
-        summary = {"total_mentions": 214, "naver_blog_count": 66, "instagram_count": 94, "place_receipt_count": 31, "place_blog_count": 12, "youtube_total_views": 87000, "ad_ratio": 41, "self_ratio": 34}
-        top_videos = [{"title": "온빈 신정호 한식 후기", "channel": "아산맛집로그", "views": 42100}, {"title": "신정호 한식집 추천", "channel": "충남맛집지도", "views": 25500}]
-    else:
-        monthly = [
-            {"month": "1월", "blog_count": 18, "instagram_count": 42, "place_receipt_count": 9, "place_blog_count": 5, "youtube_count": 6, "total_count": 80},
-            {"month": "2월", "blog_count": 22, "instagram_count": 57, "place_receipt_count": 11, "place_blog_count": 7, "youtube_count": 7, "total_count": 104},
-            {"month": "3월", "blog_count": 29, "instagram_count": 66, "place_receipt_count": 13, "place_blog_count": 8, "youtube_count": 10, "total_count": 126},
-            {"month": "4월", "blog_count": 34, "instagram_count": 88, "place_receipt_count": 17, "place_blog_count": 10, "youtube_count": 11, "total_count": 160},
-        ]
-        summary = {"total_mentions": 470, "naver_blog_count": 103, "instagram_count": 253, "place_receipt_count": 50, "place_blog_count": 30, "youtube_total_views": 264000, "ad_ratio": 62, "self_ratio": 23}
-        top_videos = [{"title": "신사역 배포차 방문 후기", "channel": "맛집탐방러", "views": 128000}, {"title": "가로수길 술집 추천 배포차", "channel": "서울먹방일기", "views": 84600}]
+    name = merchant["name"]
+
+    sample_data = {
+        "배포차": {
+            "monthly": [(18, 42, 9, 5, 6), (22, 57, 11, 7, 7), (29, 66, 13, 8, 10), (34, 88, 17, 10, 11)],
+            "summary": {"total_mentions": 470, "naver_blog_count": 103, "instagram_count": 253, "place_receipt_count": 50, "place_blog_count": 30, "youtube_total_views": 264000, "ad_ratio": 62, "self_ratio": 23},
+            "videos": [("신사역 배포차 방문 후기", "맛집탐방러", 128000), ("가로수길 술집 추천 배포차", "서울먹방일기", 84600)],
+        },
+        "소요": {
+            "monthly": [(9, 18, 4, 3, 2), (13, 22, 5, 4, 2), (16, 27, 7, 5, 3), (21, 34, 8, 6, 3)],
+            "summary": {"total_mentions": 192, "naver_blog_count": 59, "instagram_count": 101, "place_receipt_count": 24, "place_blog_count": 18, "youtube_total_views": 72000, "ad_ratio": 38, "self_ratio": 31},
+            "videos": [("일산 소요 이자카야 방문 후기", "일산맛집노트", 31800), ("장항동 술집 소요 추천", "고양먹방채널", 24700)],
+        },
+        "순자매감자탕": {
+            "monthly": [(6, 8, 5, 2, 1), (8, 11, 6, 2, 1), (10, 14, 8, 3, 2), (13, 18, 9, 4, 2)],
+            "summary": {"total_mentions": 133, "naver_blog_count": 37, "instagram_count": 51, "place_receipt_count": 28, "place_blog_count": 11, "youtube_total_views": 38000, "ad_ratio": 24, "self_ratio": 42},
+            "videos": [("순자매감자탕 동탄 방문 후기", "동탄맛집리뷰", 18600), ("화성 감자탕 맛집 추천", "경기맛집지도", 12400)],
+        },
+        "연탄김평선": {
+            "monthly": [(7, 12, 4, 2, 1), (9, 16, 5, 3, 2), (12, 22, 6, 3, 2), (15, 28, 7, 4, 3)],
+            "summary": {"total_mentions": 146, "naver_blog_count": 43, "instagram_count": 78, "place_receipt_count": 22, "place_blog_count": 12, "youtube_total_views": 56000, "ad_ratio": 29, "self_ratio": 36},
+            "videos": [("연탄김평선 선릉 맛집 후기", "강남맛집기록", 22100), ("선릉 고기집 연탄김평선", "퇴근후한끼", 19300)],
+        },
+        "라이브볼": {
+            "monthly": [(5, 9, 3, 1, 1), (7, 12, 4, 2, 1), (9, 15, 5, 2, 2), (11, 19, 6, 3, 2)],
+            "summary": {"total_mentions": 104, "naver_blog_count": 32, "instagram_count": 55, "place_receipt_count": 18, "place_blog_count": 8, "youtube_total_views": 41000, "ad_ratio": 33, "self_ratio": 28},
+            "videos": [("라이브볼 역삼점 방문 후기", "역삼맛집로그", 17500), ("역삼역 라이브볼 분위기 리뷰", "강남데이트코스", 14200)],
+        },
+    }
+
+    data = sample_data.get(name, sample_data["배포차"])
+    monthly = []
+    for i, row in enumerate(data["monthly"], start=1):
+        blog, insta, receipt, place_blog, youtube = row
+        monthly.append({
+            "month": f"{i}월",
+            "blog_count": blog,
+            "instagram_count": insta,
+            "place_receipt_count": receipt,
+            "place_blog_count": place_blog,
+            "youtube_count": youtube,
+            "total_count": blog + insta + receipt + place_blog + youtube,
+        })
+
+    summary = data["summary"]
+    top_videos = [
+        {"title": title, "channel": channel, "views": views}
+        for title, channel, views in data["videos"]
+    ]
 
     return {
         "merchant_name": merchant["name"],
@@ -161,10 +192,10 @@ def make_sample_report(merchant: dict[str, Any]) -> dict[str, Any]:
         ],
         "top_videos": top_videos,
         "insights": [
-            "최근 게시물 수가 꾸준히 증가하고 있습니다.",
-            "네이버 블로그와 인스타그램에서 가맹점 언급이 확인됩니다.",
-            "네이버 플레이스 리뷰를 통해 실제 방문 반응도 확인됩니다.",
-            "유튜브 콘텐츠는 조회수 기반 인지도 확산에 일부 기여하고 있습니다.",
+            f"{merchant['name']}의 온라인 언급량은 채널별로 차이가 있습니다.",
+            "네이버 블로그와 인스타그램은 주요 노출 채널로 확인됩니다.",
+            "네이버 플레이스 리뷰는 실제 방문 반응을 확인하는 핵심 지표입니다.",
+            "유튜브 콘텐츠는 조회수 기반 인지도 확산 여부를 함께 봐야 합니다.",
         ],
     }
 
