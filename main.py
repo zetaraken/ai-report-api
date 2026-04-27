@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.8.2")
+app = FastAPI(title="AI매출업 리포트 API", version="1.8.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -509,22 +509,44 @@ def parse_naver_count(text: str) -> int:
 
 def parse_korean_absolute_date(value: str) -> str | None:
     """
-    2026.04.26 / 2026-04-26 / 2026년 4월 26일 / 04.26 형태를 YYYY-MM-DD로 정규화합니다.
-    연도가 없는 MM.DD는 현재 연도로 추정합니다.
+    네이버/리스틀리형 날짜를 YYYY-MM-DD로 정규화합니다.
+    지원:
+    - 2026.04.26 / 2026-04-26 / 2026년 4월 26일
+    - 25.9.18.목 / 26.4.20.월
+    - 4.20.월 / 04.20  : 연도가 없는 경우 현재 연도로 추정
     """
     if not value:
         return None
 
-    s = strip_html(value).replace(" ", "")
+    s = strip_html(value).replace(" ", "").replace(",", "")
+    s = s.replace("년", ".").replace("월", ".").replace("일", "")
+    s = re.sub(r"[월화수목금토일]$", "", s)
+    s = s.strip(".")
 
-    m = re.search(r"(20\d{2})[.\-/년](\d{1,2})[.\-/월](\d{1,2})", s)
+    def valid(y: int, m: int, d: int) -> bool:
+        return 2000 <= y <= 2099 and 1 <= m <= 12 and 1 <= d <= 31
+
+    # 2026.04.26 / 2026-04-26
+    m = re.search(r"(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", s)
     if m:
-        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if valid(y, mo, d):
+            return f"{y:04d}-{mo:02d}-{d:02d}"
 
-    m = re.search(r"(\d{1,2})[.월](\d{1,2})", s)
+    # 25.9.18 / 26.4.20
+    m = re.search(r"(?<!\d)(2[0-9])[.](\d{1,2})[.](\d{1,2})(?!\d)", s)
+    if m:
+        y, mo, d = 2000 + int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if valid(y, mo, d):
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+
+    # 4.20 / 04.20
+    m = re.search(r"(?<!\d)(\d{1,2})[.](\d{1,2})(?!\d)", s)
     if m:
         now = datetime.now()
-        return f"{now.year:04d}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+        y, mo, d = now.year, int(m.group(1)), int(m.group(2))
+        if valid(y, mo, d):
+            return f"{y:04d}-{mo:02d}-{d:02d}"
 
     return None
 
@@ -933,8 +955,16 @@ def crawl_naver_place_with_playwright(place_id: str, max_clicks: int = 220) -> d
             receipt_count = visitor.get("receipt_count")
             blog_count = blog.get("blog_count")
 
-            receipt_items = cap_items_to_total(visitor.get("items", []), receipt_count)
-            place_blog_items = cap_items_to_total(blog.get("items", []), blog_count)
+            raw_receipt_items = visitor.get("items", [])
+            raw_place_blog_items = blog.get("items", [])
+
+            # 방문자 리뷰는 날짜가 충분히 파싱되면 날짜 기반 건수를 우선합니다.
+            # 네이버 헤더 카운트가 전체 누적/비공개 포함 등으로 실제 로딩 리뷰 수와 다를 수 있기 때문입니다.
+            if len(raw_receipt_items) >= 30:
+                receipt_count = len(raw_receipt_items)
+
+            receipt_items = cap_items_to_total(raw_receipt_items, receipt_count)
+            place_blog_items = cap_items_to_total(raw_place_blog_items, blog_count)
 
             context.close()
             browser.close()
@@ -1130,8 +1160,9 @@ def force_monthly_channel_total(
     reason_prefix: str = "",
 ) -> str:
     """
-    월별 합계가 요약 총량보다 커지면 중복 파싱으로 판단하고,
-    총량 기준 최근월 가중 배분으로 강제 보정합니다.
+    최종 안전장치:
+    월별 합계가 요약 총량보다 크면 초과분을 임의 배분하지 않고 최신월부터 차감해 총량과 일치시킵니다.
+    총량보다 작으면 부족분을 채우지 않습니다. 부족분 보정은 실제 날짜가 아니기 때문입니다.
     """
     if expected_total is None:
         return ""
@@ -1142,11 +1173,19 @@ def force_monthly_channel_total(
     if current_total <= expected_total:
         return ""
 
-    distributed = distribute_total_to_recent_months(expected_total, len(monthly))
-    for i, row in enumerate(monthly):
-        row[field] = distributed[i]
+    excess = current_total - expected_total
+    for row in reversed(monthly):
+        value = int(row.get(field, 0) or 0)
+        if value <= 0:
+            continue
+        cut = min(value, excess)
+        row[field] = value - cut
+        excess -= cut
+        if excess <= 0:
+            break
 
-    return f"{reason_prefix} 월별 합계 {current_total}건이 총량 {expected_total}건을 초과하여 총량 기준으로 강제 보정"
+    return f"{reason_prefix} 월별 합계 {current_total}건이 총량 {expected_total}건을 초과하여 초과분만 차감"
+
 
 def make_sample_report(
     merchant: dict[str, Any],
@@ -1302,17 +1341,17 @@ def make_sample_report(
                 dated_sum = sum(receipt_month_map.values())
 
                 if dated_sum >= max(5, int(receipt_total * 0.3)):
+                    # 날짜가 충분하면 실제 날짜 기준만 사용합니다.
+                    # 부족분을 최신월에 몰아넣거나 총량 가중 배분하지 않습니다.
                     for row in monthly:
                         row["place_receipt_count"] = int(receipt_month_map.get(row["month_key"], 0))
-                    undated = max(0, receipt_total - dated_sum)
-                    if undated and monthly:
-                        monthly[-1]["place_receipt_count"] += undated
-                        source_status["naver_place"]["reason"] += f", 영수증 날짜 미확인 {undated}건은 최신월 배정"
+                    summary["place_receipt_count"] = int(dated_sum)
+                    source_status["naver_place"]["reason"] += f", 영수증 월별값은 실제 파싱 날짜 {dated_sum}건 기준"
                 else:
-                    receipt_monthly = distribute_total_to_recent_months(receipt_total, len(monthly))
-                    for i, row in enumerate(monthly):
-                        row["place_receipt_count"] = receipt_monthly[i]
-                    source_status["naver_place"]["reason"] += f", 영수증 날짜 표본 부족({dated_sum}/{receipt_total})으로 총량 가중 배분"
+                    # 날짜가 거의 없으면 월별값을 임의 생성하지 않습니다.
+                    for row in monthly:
+                        row["place_receipt_count"] = 0
+                    source_status["naver_place"]["reason"] += f", 영수증 날짜 표본 부족({dated_sum}/{receipt_total})으로 월별 임의 배분 중단"
 
             if place_review_result.get("place_blog_count") is not None:
                 place_blog_total = int(place_review_result["place_blog_count"])
@@ -1411,7 +1450,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.8.2"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.8.3"}
 
 
 @app.get("/api/health")
@@ -1434,7 +1473,7 @@ def debug_source_config():
     return {
         "youtube_collection_mode": "html_scrape_strict_with_published_month_v5_allocate_undated",
         "naver_blog_collection_mode": "html_scrape_with_post_date",
-        "naver_place_review_collection_mode": "playwright_visible_text_capped_date_v6_total_guard",
+        "naver_place_review_collection_mode": "playwright_date_first_no_fake_distribution_v7",
         "youtube_api_key_required": False,
     }
 
