@@ -1,5 +1,7 @@
 import json
 import os
+import concurrent.futures
+import time
 import re
 from datetime import datetime, timedelta, timezone
 from html import unescape
@@ -14,7 +16,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.8.4")
+app = FastAPI(title="AI매출업 리포트 API", version="1.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1228,6 +1230,74 @@ def force_monthly_channel_total(
     return f"{reason_prefix} 월별 합계 {current_total}건이 총량 {expected_total}건을 초과하여 초과분만 차감"
 
 
+
+CRAWL_JOBS: dict[str, dict[str, Any]] = {}
+CRAWL_TIMEOUT_SECONDS = int(os.getenv("CRAWL_TIMEOUT_SECONDS", "300"))
+
+
+def now_iso() -> str:
+    return datetime.now(timezone(timedelta(hours=9))).isoformat()
+
+
+def run_with_timeout(fn, timeout_seconds: int):
+    """
+    크롤링 무한 대기 방지용 timeout wrapper.
+    timeout이 발생하면 API는 즉시 실패 상태를 반환하고, 프론트는 종료 상태를 알 수 있습니다.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(fn)
+        return future.result(timeout=timeout_seconds)
+
+
+def validate_report_result(report: dict[str, Any] | None) -> tuple[bool, list[str]]:
+    """
+    수집 결과 검증.
+    - 리포트 존재
+    - 월별 데이터 존재
+    - 월별 합계와 요약값의 과도한 불일치 방지
+    """
+    errors: list[str] = []
+
+    if not report:
+        return False, ["리포트 결과가 생성되지 않았습니다."]
+
+    monthly = report.get("monthly_summary") or []
+    summary = report.get("summary") or {}
+
+    if not monthly:
+        errors.append("월별 상세 데이터가 없습니다.")
+
+    checks = [
+        ("place_receipt_count", "영수증 리뷰"),
+        ("place_blog_count", "플레이스 블로그 리뷰"),
+        ("naver_blog_count", "네이버 블로그"),
+    ]
+
+    for summary_key, label in checks:
+        if summary_key not in summary:
+            continue
+
+        if summary_key == "naver_blog_count":
+            monthly_key = "blog_count"
+        else:
+            monthly_key = summary_key
+
+        monthly_sum = sum(int(row.get(monthly_key, 0) or 0) for row in monthly)
+        summary_total = int(summary.get(summary_key, 0) or 0)
+
+        # 월별 합계가 요약보다 20% 이상 크면 중복 파싱 가능성이 큼
+        if summary_total > 0 and monthly_sum > int(summary_total * 1.2):
+            errors.append(f"{label} 월별 합계({monthly_sum})가 요약 총량({summary_total})보다 과도하게 큽니다.")
+
+    return len(errors) == 0, errors
+
+
+def set_job_status(job_id: str, **updates) -> None:
+    job = CRAWL_JOBS.get(job_id, {})
+    job.update(updates)
+    job["updated_at"] = now_iso()
+    CRAWL_JOBS[job_id] = job
+
 def make_sample_report(
     merchant: dict[str, Any],
     period: str = "최근 6개월",
@@ -1491,7 +1561,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.8.4"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.9.0"}
 
 
 @app.get("/api/health")
@@ -1576,31 +1646,101 @@ def get_report(
 
 
 @app.post("/api/crawl-jobs")
-def create_crawl_job(payload: CrawlJobCreate, admin: str = Depends(verify_token)):
-    merchant = next((m for m in MERCHANTS if m["id"] == payload.merchant_id), None)
+def create_crawl_job(payload: CrawlJobCreate, email: str = Depends(verify_token)):
+    """
+    동기식 수집 실행 + timeout + 검증.
+    프론트는 이 응답을 받을 때 완료/실패 여부를 즉시 알 수 있습니다.
+    """
+    job_id = str(uuid4())
+    merchant_id = payload.merchant_id
+    period = getattr(payload, "period", "최근 6개월") or "최근 6개월"
 
+    merchant = next((m for m in MERCHANTS if m["id"] == merchant_id), None)
     if not merchant:
         raise HTTPException(status_code=404, detail="가맹점을 찾을 수 없습니다.")
 
-    REPORTS[payload.merchant_id] = make_sample_report(
-        merchant,
-        period=payload.period,
-        start_date=payload.start_date,
-        end_date=payload.end_date,
-        use_live_youtube=True,
-        use_live_naver=True,
-    )
-
-    return {
-        "id": f"job_{uuid4().hex[:10]}",
-        "merchant_id": payload.merchant_id,
-        "period": payload.period,
-        "start_date": payload.start_date,
-        "end_date": payload.end_date,
-        "status": "completed",
-        "source_status": REPORTS[payload.merchant_id].get("source_status", {}),
-        "created_at": now_text()
+    CRAWL_JOBS[job_id] = {
+        "job_id": job_id,
+        "merchant_id": merchant_id,
+        "merchant_name": merchant.get("name"),
+        "period": period,
+        "status": "running",
+        "message": "수집 작업을 시작했습니다.",
+        "started_at": now_iso(),
+        "updated_at": now_iso(),
+        "finished_at": None,
+        "elapsed_seconds": 0,
+        "validation_errors": [],
     }
+
+    started = time.time()
+
+    try:
+        def work():
+            # 기존 make_sample_report를 실제 수집 함수로 사용
+            result = make_sample_report(merchant, period=period) if "period" in make_sample_report.__code__.co_varnames else make_sample_report(merchant)
+            REPORTS[merchant_id] = result
+            return result
+
+        report = run_with_timeout(work, CRAWL_TIMEOUT_SECONDS)
+        elapsed = int(time.time() - started)
+
+        is_valid, validation_errors = validate_report_result(report)
+
+        if not is_valid:
+            set_job_status(
+                job_id,
+                status="warning",
+                message="수집은 완료되었지만 검증 경고가 있습니다.",
+                finished_at=now_iso(),
+                elapsed_seconds=elapsed,
+                validation_errors=validation_errors,
+                report_generated_at=report.get("generated_at") if report else None,
+            )
+        else:
+            set_job_status(
+                job_id,
+                status="success",
+                message="수집이 완료되었습니다.",
+                finished_at=now_iso(),
+                elapsed_seconds=elapsed,
+                validation_errors=[],
+                report_generated_at=report.get("generated_at") if report else None,
+            )
+
+        return CRAWL_JOBS[job_id]
+
+    except concurrent.futures.TimeoutError:
+        elapsed = int(time.time() - started)
+        set_job_status(
+            job_id,
+            status="timeout",
+            message=f"수집 제한 시간({CRAWL_TIMEOUT_SECONDS}초)을 초과했습니다. 네이버/유튜브 응답 지연 또는 무한 스크롤 종료 실패 가능성이 있습니다.",
+            finished_at=now_iso(),
+            elapsed_seconds=elapsed,
+            validation_errors=["timeout"],
+        )
+        return CRAWL_JOBS[job_id]
+
+    except Exception as e:
+        elapsed = int(time.time() - started)
+        set_job_status(
+            job_id,
+            status="error",
+            message=f"수집 실패: {str(e)[:300]}",
+            finished_at=now_iso(),
+            elapsed_seconds=elapsed,
+            validation_errors=[str(e)[:300]],
+        )
+        return CRAWL_JOBS[job_id]
+
+
+@app.get("/api/crawl-jobs/{job_id}")
+def get_crawl_job(job_id: str, email: str = Depends(verify_token)):
+    job = CRAWL_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="수집 작업을 찾을 수 없습니다.")
+    return job
 
 
 @app.get("/api/reports/{merchant_id}/pdf")
