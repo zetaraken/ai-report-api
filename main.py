@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.8.1")
+app = FastAPI(title="AI매출업 리포트 API", version="1.8.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1122,6 +1122,32 @@ def expand_monthly(base_rows: list[tuple[int, int, int, int, int]], months: int)
     return rows[-months:]
 
 
+
+def force_monthly_channel_total(
+    monthly: list[dict[str, Any]],
+    field: str,
+    expected_total: int | None,
+    reason_prefix: str = "",
+) -> str:
+    """
+    월별 합계가 요약 총량보다 커지면 중복 파싱으로 판단하고,
+    총량 기준 최근월 가중 배분으로 강제 보정합니다.
+    """
+    if expected_total is None:
+        return ""
+
+    expected_total = int(expected_total)
+    current_total = sum(int(row.get(field, 0) or 0) for row in monthly)
+
+    if current_total <= expected_total:
+        return ""
+
+    distributed = distribute_total_to_recent_months(expected_total, len(monthly))
+    for i, row in enumerate(monthly):
+        row[field] = distributed[i]
+
+    return f"{reason_prefix} 월별 합계 {current_total}건이 총량 {expected_total}건을 초과하여 총량 기준으로 강제 보정"
+
 def make_sample_report(
     merchant: dict[str, Any],
     period: str = "최근 6개월",
@@ -1326,6 +1352,35 @@ def make_sample_report(
         + youtube_count
     )
 
+    # 최종 안전 보정: 월별 상세 합계가 요약 총량보다 커지는 경우 방지
+    receipt_fix_reason = force_monthly_channel_total(
+        monthly,
+        "place_receipt_count",
+        summary.get("place_receipt_count"),
+        "영수증 리뷰",
+    )
+    if receipt_fix_reason:
+        source_status["naver_place"]["reason"] += ", " + receipt_fix_reason
+
+    place_blog_fix_reason = force_monthly_channel_total(
+        monthly,
+        "place_blog_count",
+        summary.get("place_blog_count"),
+        "플레이스 블로그 리뷰",
+    )
+    if place_blog_fix_reason:
+        source_status["naver_place"]["reason"] += ", " + place_blog_fix_reason
+
+    # 전체 컬럼도 보정된 월별값 기준으로 재계산
+    for row in monthly:
+        row["total_count"] = (
+            int(row.get("blog_count", 0) or 0)
+            + int(row.get("instagram_count", 0) or 0)
+            + int(row.get("place_receipt_count", 0) or 0)
+            + int(row.get("place_blog_count", 0) or 0)
+            + int(row.get("youtube_count", 0) or 0)
+        )
+
     return {
         "merchant_name": merchant["name"],
         "region": merchant.get("region", ""),
@@ -1356,7 +1411,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.8.1"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.8.2"}
 
 
 @app.get("/api/health")
@@ -1379,7 +1434,7 @@ def debug_source_config():
     return {
         "youtube_collection_mode": "html_scrape_strict_with_published_month_v5_allocate_undated",
         "naver_blog_collection_mode": "html_scrape_with_post_date",
-        "naver_place_review_collection_mode": "playwright_visible_text_capped_date_v5",
+        "naver_place_review_collection_mode": "playwright_visible_text_capped_date_v6_total_guard",
         "youtube_api_key_required": False,
     }
 
