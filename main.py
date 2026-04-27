@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.8.0")
+app = FastAPI(title="AI매출업 리포트 API", version="1.8.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -710,6 +710,20 @@ def parse_review_dates_from_blob(blob: str, source: str, max_items: int = 3000) 
     return items
 
 
+def cap_items_to_total(items: list[dict[str, Any]], target_count: int | None) -> list[dict[str, Any]]:
+    """
+    날짜 후보가 표시 총 리뷰 수보다 과도하게 많으면 중복 파싱으로 판단하고 총 리뷰 수로 상한 처리합니다.
+    네이버 리뷰는 최신순으로 수집하므로 앞쪽 데이터부터 유지합니다.
+    """
+    if not target_count or target_count <= 0:
+        return items
+
+    if len(items) <= target_count:
+        return items
+
+    return items[:target_count]
+
+
 def safe_click_by_text(page, labels: list[str]) -> bool:
     for label in labels:
         selectors = [
@@ -731,26 +745,30 @@ def safe_click_by_text(page, labels: list[str]) -> bool:
 
 
 def get_page_blob(page) -> str:
+    """
+    rendered HTML까지 섞으면 같은 리뷰 날짜가 script/json/DOM에 반복 포함되어
+    월별 건수가 수천 건으로 뻥튀기될 수 있습니다.
+    따라서 기본 수집은 실제 화면 텍스트(inner_text)만 사용합니다.
+    """
     parts = []
     try:
         parts.append(page.inner_text("body", timeout=8000))
     except Exception:
         pass
-    try:
-        parts.append(page.content())
-    except Exception:
-        pass
+
     try:
         for frame in page.frames:
             try:
                 if frame == page.main_frame:
                     continue
-                parts.append(frame.locator("body").inner_text(timeout=3000))
-                parts.append(frame.content())
+                frame_text = frame.locator("body").inner_text(timeout=3000)
+                if frame_text and len(frame_text) > 100:
+                    parts.append(frame_text)
             except Exception:
                 continue
     except Exception:
         pass
+
     return "\n".join([p for p in parts if p])
 
 
@@ -786,7 +804,7 @@ def scroll_until_review_count_target(page, target_count: int | None, source: str
 
         # 목표 카운트의 95% 이상이면 충분히 수집된 것으로 판단
         if target_count and len(items) >= int(target_count * 0.95):
-            return blob, items
+            return blob, cap_items_to_total(items, target_count)
 
         blob_len = len(blob)
         item_count = len(items)
@@ -801,7 +819,7 @@ def scroll_until_review_count_target(page, target_count: int | None, source: str
         if stable >= 18:
             break
 
-    return best_blob, best_items
+    return best_blob, cap_items_to_total(best_items, target_count)
 
 
 def collect_naver_tab(page, urls: list[str], source: str, max_rounds: int = 220) -> dict[str, Any]:
@@ -915,8 +933,8 @@ def crawl_naver_place_with_playwright(place_id: str, max_clicks: int = 220) -> d
             receipt_count = visitor.get("receipt_count")
             blog_count = blog.get("blog_count")
 
-            receipt_items = visitor.get("items", [])
-            place_blog_items = blog.get("items", [])
+            receipt_items = cap_items_to_total(visitor.get("items", []), receipt_count)
+            place_blog_items = cap_items_to_total(blog.get("items", []), blog_count)
 
             context.close()
             browser.close()
@@ -1253,7 +1271,8 @@ def make_sample_report(
                 receipt_total = int(place_review_result["place_receipt_count"])
                 summary["place_receipt_count"] = receipt_total
 
-                receipt_month_map = distribute_items_by_month(place_review_result.get("receipt_items", []), month_keys)
+                receipt_items_for_month = cap_items_to_total(place_review_result.get("receipt_items", []), receipt_total)
+                receipt_month_map = distribute_items_by_month(receipt_items_for_month, month_keys)
                 dated_sum = sum(receipt_month_map.values())
 
                 if dated_sum >= max(5, int(receipt_total * 0.3)):
@@ -1273,7 +1292,8 @@ def make_sample_report(
                 place_blog_total = int(place_review_result["place_blog_count"])
                 summary["place_blog_count"] = place_blog_total
 
-                place_blog_month_map = distribute_items_by_month(place_review_result.get("place_blog_items", []), month_keys)
+                place_blog_items_for_month = cap_items_to_total(place_review_result.get("place_blog_items", []), place_blog_total)
+                place_blog_month_map = distribute_items_by_month(place_blog_items_for_month, month_keys)
                 dated_sum = sum(place_blog_month_map.values())
 
                 if dated_sum >= max(3, int(place_blog_total * 0.3)):
@@ -1336,7 +1356,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.8.0"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.8.1"}
 
 
 @app.get("/api/health")
@@ -1359,7 +1379,7 @@ def debug_source_config():
     return {
         "youtube_collection_mode": "html_scrape_strict_with_published_month_v5_allocate_undated",
         "naver_blog_collection_mode": "html_scrape_with_post_date",
-        "naver_place_review_collection_mode": "playwright_full_scroll_text_html_date_v4",
+        "naver_place_review_collection_mode": "playwright_visible_text_capped_date_v5",
         "youtube_api_key_required": False,
     }
 
