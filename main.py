@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.8.3")
+app = FastAPI(title="AI매출업 리포트 API", version="1.8.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -747,23 +747,63 @@ def cap_items_to_total(items: list[dict[str, Any]], target_count: int | None) ->
 
 
 def safe_click_by_text(page, labels: list[str]) -> bool:
+    """
+    네이버 플레이스 리뷰에서 '펼쳐서 더보기' / '더보기' / 아래화살표형 버튼을 최대한 클릭합니다.
+    """
+    clicked_any = False
+
+    selectors = [
+        "button:has-text('펼쳐서 더보기')",
+        "button:has-text('더보기')",
+        "button:has-text('리뷰 더보기')",
+        "button:has-text('펼쳐보기')",
+        "a:has-text('펼쳐서 더보기')",
+        "a:has-text('더보기')",
+        "[role=button]:has-text('펼쳐서 더보기')",
+        "[role=button]:has-text('더보기')",
+        "[aria-label*='더보기']",
+        "[aria-label*='펼치']",
+    ]
+
     for label in labels:
-        selectors = [
+        selectors.extend([
             f"text={label}",
             f"button:has-text('{label}')",
             f"a:has-text('{label}')",
             f"[role=button]:has-text('{label}')",
-        ]
-        for selector in selectors:
-            try:
-                loc = page.locator(selector).last
-                if loc.count() > 0 and loc.is_visible():
-                    loc.click(timeout=1000)
-                    page.wait_for_timeout(600)
-                    return True
-            except Exception:
-                continue
-    return False
+        ])
+
+    for selector in selectors:
+        try:
+            loc = page.locator(selector)
+            count = min(loc.count(), 25)
+            for i in range(count):
+                try:
+                    item = loc.nth(i)
+                    if item.is_visible():
+                        item.scroll_into_view_if_needed(timeout=1000)
+                        page.wait_for_timeout(120)
+                        item.click(timeout=1200, force=True)
+                        page.wait_for_timeout(450)
+                        clicked_any = True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return clicked_any
+
+
+def click_expand_buttons_repeatedly(page, rounds: int = 4) -> int:
+    click_count = 0
+    for _ in range(rounds):
+        before = click_count
+        if safe_click_by_text(page, ["펼쳐서 더보기", "더보기", "리뷰 더보기", "펼쳐보기", "전체보기"]):
+            click_count += 1
+        page.wait_for_timeout(300)
+        if click_count == before:
+            break
+    return click_count
 
 
 def get_page_blob(page) -> str:
@@ -794,10 +834,9 @@ def get_page_blob(page) -> str:
     return "\n".join([p for p in parts if p])
 
 
-def scroll_until_review_count_target(page, target_count: int | None, source: str, max_rounds: int = 220) -> tuple[str, list[dict[str, Any]]]:
+def scroll_until_review_count_target(page, target_count: int | None, source: str, max_rounds: int = 260) -> tuple[str, list[dict[str, Any]]]:
     """
-    Listly와 최대한 맞추기 위해 날짜 후보 수가 헤더 총 리뷰 수에 근접할 때까지 스크롤합니다.
-    target_count가 없으면 body/html 성장 멈춤 기준으로 종료합니다.
+    리뷰 카드 로딩 + '펼쳐서 더보기' 버튼 클릭을 함께 수행합니다.
     """
     last_blob_len = 0
     last_item_count = 0
@@ -806,39 +845,41 @@ def scroll_until_review_count_target(page, target_count: int | None, source: str
     best_items: list[dict[str, Any]] = []
 
     for _ in range(max_rounds):
-        # 펼침/더보기류 버튼 처리
-        safe_click_by_text(page, ["더보기", "리뷰 더보기", "펼쳐보기", "더보기 접기", "전체보기", "접기"])
+        try:
+            click_expand_buttons_repeatedly(page, rounds=3)
+        except Exception:
+            pass
 
         try:
-            page.mouse.wheel(0, 3200)
-            page.wait_for_timeout(550)
-            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(350)
+            page.mouse.wheel(0, 1800)
+            page.wait_for_timeout(500)
+            click_expand_buttons_repeatedly(page, rounds=2)
+            page.mouse.wheel(0, 1800)
+            page.wait_for_timeout(500)
         except Exception:
             pass
 
         blob = get_page_blob(page)
-        items = parse_review_dates_from_blob(blob, source=source, max_items=4000)
+        items = parse_review_dates_from_blob(blob, source=source, max_items=5000)
 
         if len(items) > len(best_items):
             best_items = items
             best_blob = blob
 
-        # 목표 카운트의 95% 이상이면 충분히 수집된 것으로 판단
         if target_count and len(items) >= int(target_count * 0.95):
             return blob, cap_items_to_total(items, target_count)
 
         blob_len = len(blob)
         item_count = len(items)
 
-        if blob_len <= last_blob_len + 100 and item_count <= last_item_count:
+        if blob_len <= last_blob_len + 80 and item_count <= last_item_count:
             stable += 1
         else:
             stable = 0
             last_blob_len = max(last_blob_len, blob_len)
             last_item_count = max(last_item_count, item_count)
 
-        if stable >= 18:
+        if stable >= 22:
             break
 
     return best_blob, cap_items_to_total(best_items, target_count)
@@ -972,7 +1013,7 @@ def crawl_naver_place_with_playwright(place_id: str, max_clicks: int = 220) -> d
             return {
                 "status": "ok",
                 "reason": (
-                    f"Playwright v4 full-scroll 수집 완료. "
+                    f"Playwright v8 expand-button+full-scroll 수집 완료. "
                     f"receipt_count={receipt_count}, receipt_dates={len(receipt_items)}, "
                     f"blog_count={blog_count}, blog_dates={len(place_blog_items)}, "
                     f"visitor_url={visitor.get('url','')}, blog_url={blog.get('url','')}"
@@ -1450,7 +1491,7 @@ def make_sample_report(
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.8.3"}
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.8.4"}
 
 
 @app.get("/api/health")
@@ -1473,7 +1514,7 @@ def debug_source_config():
     return {
         "youtube_collection_mode": "html_scrape_strict_with_published_month_v5_allocate_undated",
         "naver_blog_collection_mode": "html_scrape_with_post_date",
-        "naver_place_review_collection_mode": "playwright_date_first_no_fake_distribution_v7",
+        "naver_place_review_collection_mode": "playwright_expand_button_full_scroll_v8",
         "youtube_api_key_required": False,
     }
 
