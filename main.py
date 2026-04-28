@@ -1,23 +1,59 @@
-import json
-import os
+"""
+AI매출업 가맹점 분석 시스템 V2
+- 네이버 플레이스 (영수증/블로그 리뷰) Playwright 수집
+- 네이버 블로그 수집
+- 인스타그램 수집
+- 유튜브 수집
+- 일별/월별 집계
+- Claude API 자체분석 리포트
+- PDF 다운로드
+"""
+
+import asyncio
 import concurrent.futures
-import time
+import hashlib
+import json
+import logging
+import os
 import re
-from datetime import datetime, timedelta, timezone
+import time
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
 from html import unescape
-from typing import Any
-from urllib.parse import quote_plus, urlparse
-from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import quote_plus
+from urllib.request import Request, build_opener, HTTPRedirectHandler, urlopen
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, status
+import anthropic
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-app = FastAPI(title="AI매출업 리포트 API", version="1.9.0")
+# 엑셀 생성기
+try:
+    from excel_export import make_raw_excel, make_daily_excel, make_monthly_excel
+    EXCEL_AVAILABLE = True
+except ImportError:
+    EXCEL_AVAILABLE = False
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ── 경로 설정 ──
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+DB_DIR   = DATA_DIR / "db"
+OUT_DIR  = DATA_DIR / "outputs"
+LOG_DIR  = DATA_DIR / "logs"
+for d in [DATA_DIR, DB_DIR, OUT_DIR, LOG_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="AI매출업 리포트 API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,40 +61,97 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 security = HTTPBearer()
 
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "zetarise@gmail.com").strip()
+# ── 환경변수 ──
+ADMIN_EMAIL    = os.getenv("ADMIN_EMAIL", "zetarise@gmail.com").strip()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "4858").strip()
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "ai-report-secret-2026").strip()
-JWT_ALGORITHM = "HS256"
+JWT_ALGORITHM  = "HS256"
 JWT_EXPIRE_MINUTES = 720
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+CRAWL_TIMEOUT      = int(os.getenv("CRAWL_TIMEOUT_SECONDS", "480"))
+
+# ── 인메모리 저장소 (SQLite 없이 운영, 재시작시 초기화) ──
+REPORTS: dict[str, dict] = {}
+CRAWL_JOBS: dict[str, dict] = {}
+
+# ── 가맹점 목록 (고정 데이터 → 추후 DB 연동) ──
+MERCHANTS = [
+    {
+        "id": "bae_po_cha",
+        "name": "배포차",
+        "region": "서울 강남구",
+        "address": "서울 강남구 도산대로1길 16 지상1, 2층",
+        "naver_place_url": "https://naver.me/xv6tlDW3",
+        "blog_keywords": ["신사역 배포차", "신사동 배포차"],
+        "instagram_hashtags": ["배포차"],
+        "instagram_channel": "bae_po_cha",
+        "youtube_keywords": ["신사역 배포차", "신사동 배포차"],
+    },
+    {
+        "id": "soyo_ilsan",
+        "name": "소요",
+        "region": "경기 고양시",
+        "address": "경기 고양시 일산동구 월드고양로 21 상가동 1동 1층 309호, 310호",
+        "naver_place_url": "https://naver.me/F0AHoPtm",
+        "blog_keywords": ["일산 소요", "고양시 소요", "일산동구 소요", "장항동 소요"],
+        "instagram_hashtags": ["일산소요", "고양시소요"],
+        "instagram_channel": "soyo_izakaya",
+        "youtube_keywords": ["일산 소요", "고양시 소요"],
+    },
+    {
+        "id": "soon_jamae",
+        "name": "순자매감자탕",
+        "region": "경기 화성시",
+        "address": "경기 화성시 동탄구 동탄기흥로257번가길 24-11 1층",
+        "naver_place_url": "https://naver.me/GNRzS59C",
+        "blog_keywords": ["순자매감자탕"],
+        "instagram_hashtags": ["순자매감자탕"],
+        "instagram_channel": "",
+        "youtube_keywords": ["순자매감자탕"],
+    },
+    {
+        "id": "yeontan_kim",
+        "name": "연탄김평선",
+        "region": "서울 강남구",
+        "address": "서울 강남구 선릉로90길 64 지상1층",
+        "naver_place_url": "https://naver.me/xNLZbjfI",
+        "blog_keywords": ["연탄김평선"],
+        "instagram_hashtags": ["연탄김평선"],
+        "instagram_channel": "yeon_tan_pyeongseon_kim",
+        "youtube_keywords": ["연탄김평선"],
+    },
+    {
+        "id": "liveball_yeoksam",
+        "name": "라이브볼",
+        "region": "서울 강남구",
+        "address": "서울 강남구 테헤란로 147 지하 1층 3호",
+        "naver_place_url": "https://naver.me/5bVsye2y",
+        "blog_keywords": ["라이브볼 역삼점", "라이브볼 역삼역", "라이브볼 역삼동"],
+        "instagram_hashtags": ["라이브볼역삼점", "라이브볼역삼역"],
+        "instagram_channel": "",
+        "youtube_keywords": ["라이브볼 역삼점", "라이브볼 역삼역"],
+    },
+]
 
 
+# ══════════════════════════════════════════
+# 인증
+# ══════════════════════════════════════════
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
-
 class CrawlJobCreate(BaseModel):
     merchant_id: str
     period: str = "최근 6개월"
-    start_date: str | None = None
-    end_date: str | None = None
-
-
-def now_text() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
 
 def create_token(email: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES)
-    return jwt.encode(
-        {"sub": email, "role": "admin", "exp": expire},
-        JWT_SECRET_KEY,
-        algorithm=JWT_ALGORITHM,
-    )
-
+    return jwt.encode({"sub": email, "exp": expire}, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     try:
@@ -71,1678 +164,1198 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
         raise HTTPException(status_code=401, detail="토큰 오류")
 
 
-MERCHANTS = [
-    {
-        "id": "bae_po_cha",
-        "name": "배포차",
-        "region": "서울 강남구",
-        "address": "서울 강남구 도산대로1길 16 지상1, 2층",
-        "naver_place_url": "https://naver.me/xv6tlDW3",
-        "blog_keywords": "신사역 배포차, 신사동 배포차",
-        "instagram_hashtags": "배포차",
-        "instagram_channel": "https://www.instagram.com/bae_po_cha",
-        "youtube_keywords": "신사역 배포차, 신사동 배포차",
-    },
-    {
-        "id": "soyo_ilsan",
-        "name": "소요",
-        "region": "경기 고양시",
-        "address": "경기 고양시 일산동구 월드고양로 21 상가동 1동 1층 309호, 310호",
-        "naver_place_url": "https://naver.me/F0AHoPtm",
-        "blog_keywords": "일산 소요, 고양시 소요, 일산동구 소요, 장항동 소요",
-        "instagram_hashtags": "일산 소요, 고양시 소요, 일산동구 소요, 장항동 소요",
-        "instagram_channel": "https://www.instagram.com/soyo_izakaya",
-        "youtube_keywords": "일산 소요, 고양시 소요, 일산동구 소요, 장항동 소요",
-    },
-    {
-        "id": "soon_jamae_gamjatang",
-        "name": "순자매감자탕",
-        "region": "경기 화성시",
-        "address": "경기 화성시 동탄구 동탄기흥로257번가길 24-11 1층",
-        "naver_place_url": "https://naver.me/GNRzS59C",
-        "blog_keywords": "순자매감자탕",
-        "instagram_hashtags": "순자매감자탕",
-        "instagram_channel": "",
-        "youtube_keywords": "순자매감자탕",
-    },
-    {
-        "id": "yeontan_kim_pyeongseon",
-        "name": "연탄김평선",
-        "region": "서울 강남구",
-        "address": "서울 강남구 선릉로90길 64 지상1층",
-        "naver_place_url": "https://naver.me/xNLZbjfI",
-        "blog_keywords": "연탄김평선",
-        "instagram_hashtags": "연탄김평선",
-        "instagram_channel": "https://www.instagram.com/yeon_tan_pyeongseon_kim",
-        "youtube_keywords": "연탄김평선",
-    },
-    {
-        "id": "liveball_yeoksam",
-        "name": "라이브볼",
-        "region": "서울 강남구",
-        "address": "서울 강남구 테헤란로 147 지하 1층 3호 라이브볼",
-        "naver_place_url": "https://naver.me/5bVsye2y",
-        "blog_keywords": "라이브볼 역삼점, 라이브볼 역삼역, 라이브볼 역삼동",
-        "instagram_hashtags": "라이브볼 역삼점, 라이브볼 역삼역, 라이브볼 역삼동",
-        "instagram_channel": "",
-        "youtube_keywords": "라이브볼 역삼점, 라이브볼 역삼역, 라이브볼 역삼동",
-    },
-]
+# ══════════════════════════════════════════
+# 유틸리티
+# ══════════════════════════════════════════
+def now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-REPORTS: dict[str, dict[str, Any]] = {}
+def now_iso() -> str:
+    return datetime.now(timezone(timedelta(hours=9))).isoformat()
 
+def fetch_text(url: str, timeout: int = 15) -> str:
+    req = Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+    })
+    with urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="ignore")
 
-def get_period_label(period: str = "최근 6개월", start_date: str | None = None, end_date: str | None = None) -> str:
-    if period in ("custom", "기간 설정"):
-        return f"{start_date} ~ {end_date}" if start_date and end_date else "기간 설정"
-    return period
+def strip_html(v: str) -> str:
+    return unescape(re.sub(r"<.*?>", "", v or "")).strip()
 
-
-def get_month_count(period: str) -> int:
-    if period == "최근 1개월":
-        return 1
-    if period == "최근 3개월":
-        return 3
-    if period == "최근 1년":
-        return 12
-    return 6
-
-
-def split_keywords(value: str | list[str] | None) -> list[str]:
-    if not value:
-        return []
-    if isinstance(value, list):
-        return [str(v).strip() for v in value if str(v).strip()]
-    return [v.strip() for v in str(value).split(",") if v.strip()]
-
-
-def fetch_text(url: str) -> str:
-    req = Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        },
-    )
-    with urlopen(req, timeout=15) as response:
-        return response.read().decode("utf-8", errors="ignore")
-
-
-def parse_compact_view_count(text: str) -> int:
+def parse_naver_date(text: str) -> Optional[str]:
+    """네이버 날짜 텍스트 → YYYY-MM-DD"""
     if not text:
-        return 0
-    raw = text.replace("조회수", "").replace("views", "").replace(",", "").replace(" ", "").strip()
-    m = re.search(r"(\d+(?:\.\d+)?)(만|천|K|M)?", raw, re.IGNORECASE)
-    if not m:
-        return 0
-    num = float(m.group(1))
-    unit = (m.group(2) or "").lower()
-    if unit == "만":
-        num *= 10000
-    elif unit == "천":
-        num *= 1000
-    elif unit == "k":
-        num *= 1000
-    elif unit == "m":
-        num *= 1000000
-    return int(num)
-
-
-def build_recent_month_keys(month_count: int) -> list[str]:
-    today = datetime.now()
-    months: list[str] = []
-    year = today.year
-    month = today.month
-
-    for offset in range(month_count - 1, -1, -1):
-        y = year
-        m = month - offset
-        while m <= 0:
-            m += 12
-            y -= 1
-        months.append(f"{y}-{m:02d}")
-
-    return months
-
-
-def month_key_to_label(month_key: str) -> str:
-    year, month = month_key.split("-")
-    return f"{year}년 {int(month)}월"
-
-
-def estimate_published_month_key(label: str) -> str | None:
-    """
-    YouTube 검색 HTML의 publishedTimeText를 기준으로 업로드 월을 추정합니다.
-    예: '3개월 전', '2 weeks ago', '1 year ago'
-    """
-    if not label:
         return None
+    s = strip_html(text).replace(" ", "")
+    s = s.replace("년", ".").replace("월", ".").replace("일", "")
+    s = re.sub(r"[월화수목금토일]$", "", s).strip(".")
 
-    text = label.strip().lower()
-    now = datetime.now()
-
-    m = re.search(r"(\d+)\s*(초|분|시간|일|주|개월|달|년)", text)
+    m = re.search(r"(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", s)
     if m:
-        value = int(m.group(1))
-        unit = m.group(2)
-        if unit in ("초", "분", "시간"):
-            dt = now
-        elif unit == "일":
-            dt = now - timedelta(days=value)
-        elif unit == "주":
-            dt = now - timedelta(weeks=value)
-        elif unit in ("개월", "달"):
-            month = now.month - value
-            year = now.year
-            while month <= 0:
-                month += 12
-                year -= 1
-            dt = now.replace(year=year, month=month)
-        elif unit == "년":
-            dt = now.replace(year=now.year - value)
-        else:
-            dt = now
-        return f"{dt.year}-{dt.month:02d}"
-
-    m = re.search(r"(\d+)\s*(second|minute|hour|day|week|month|year)s?\s+ago", text)
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    m = re.search(r"(2[0-9])[.](\d{1,2})[.](\d{1,2})", s)
     if m:
-        value = int(m.group(1))
-        unit = m.group(2)
-        if unit in ("second", "minute", "hour"):
-            dt = now
-        elif unit == "day":
-            dt = now - timedelta(days=value)
-        elif unit == "week":
-            dt = now - timedelta(weeks=value)
-        elif unit == "month":
-            month = now.month - value
-            year = now.year
-            while month <= 0:
-                month += 12
-                year -= 1
-            dt = now.replace(year=year, month=month)
-        elif unit == "year":
-            dt = now.replace(year=now.year - value)
-        else:
-            dt = now
-        return f"{dt.year}-{dt.month:02d}"
-
+        y, mo, d = 2000+int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    # "3일 전"
+    m = re.match(r"(\d+)일전", s)
+    if m:
+        dt = datetime.now() - timedelta(days=int(m.group(1)))
+        return dt.strftime("%Y-%m-%d")
+    m = re.match(r"(\d+)주전", s)
+    if m:
+        dt = datetime.now() - timedelta(weeks=int(m.group(1)))
+        return dt.strftime("%Y-%m-%d")
+    m = re.match(r"(\d+)개월전", s)
+    if m:
+        dt = datetime.now() - timedelta(days=int(m.group(1))*30)
+        return dt.strftime("%Y-%m-%d")
     return None
 
+def date_to_month_key(d: Optional[str]) -> Optional[str]:
+    if not d:
+        return None
+    m = re.search(r"(20\d{2})-(\d{2})", d)
+    return f"{m.group(1)}-{m.group(2)}" if m else None
 
-def normalize_text(value: str) -> str:
-    return re.sub(r"[^0-9a-zA-Z가-힣]", "", value or "").lower()
+def build_month_keys(month_count: int) -> list[str]:
+    today = datetime.now()
+    keys = []
+    for offset in range(month_count - 1, -1, -1):
+        y, mo = today.year, today.month - offset
+        while mo <= 0:
+            mo += 12; y -= 1
+        keys.append(f"{y}-{mo:02d}")
+    return keys
 
+def get_month_count(period: str) -> int:
+    mapping = {"최근 1개월": 1, "최근 3개월": 3, "최근 6개월": 6, "최근 1년": 12}
+    return mapping.get(period, 6)
 
-def strip_html(value: str) -> str:
-    return unescape(re.sub(r"<.*?>", "", value or "")).strip()
-
-
-def extract_first(patterns: list[str], text: str) -> str:
-    for pattern in patterns:
-        m = re.search(pattern, text, re.S)
-        if m:
-            return strip_html(m.group(1))
-    return ""
-
-
-def is_relevant_youtube_video(merchant: dict[str, Any], title: str, channel: str) -> bool:
-    merchant_name = merchant["name"]
-    title_n = normalize_text(title)
-    channel_n = normalize_text(channel)
-    target_n = normalize_text(merchant_name)
-    combined = title_n + channel_n
-
-    if not title_n:
-        return False
-
-    if target_n and target_n in combined:
-        return True
-
-    keywords = split_keywords(merchant.get("youtube_keywords"))
-    for keyword in keywords:
-        keyword_n = normalize_text(keyword)
-        if keyword_n and keyword_n in combined:
-            return True
-
-    return False
-
-
-def extract_youtube_candidates_from_html(html: str) -> list[dict[str, Any]]:
-    """
-    YouTube 검색 HTML에서 videoId 주변 JSON 조각을 기준으로 제목/채널/조회수/업로드시점을 추출합니다.
-    v4: title 추출 실패 시 '관련 영상' 같은 가짜 항목을 만들지 않고 제외합니다.
-    """
-    candidates: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    for match in re.finditer(r'"videoId":"([^"]{8,20})"', html):
-        video_id = match.group(1)
-        if video_id in seen:
-            continue
-        seen.add(video_id)
-
-        start = max(0, match.start() - 3500)
-        end = min(len(html), match.end() + 6500)
-        chunk = html[start:end]
-
-        title = extract_first([
-            r'"title":\{"runs":\[\{"text":"(.*?)"\}\]',
-            r'"title":\{"simpleText":"(.*?)"\}',
-            r'"headline":\{"simpleText":"(.*?)"\}',
-            r'"accessibilityData":\{"label":"(.*?)"\}',
-        ], chunk)
-
-        # accessibility label은 제목 외 메타데이터가 붙을 수 있어 앞부분만 사용
-        if "게시자:" in title:
-            title = title.split("게시자:")[0].strip()
-        if " by " in title and " views" in title.lower():
-            title = title.split(" by ")[0].strip()
-
-        channel = extract_first([
-            r'"ownerText":\{"runs":\[\{"text":"(.*?)"',
-            r'"shortBylineText":\{"runs":\[\{"text":"(.*?)"',
-            r'"longBylineText":\{"runs":\[\{"text":"(.*?)"',
-            r'"channelName":"(.*?)"',
-        ], chunk)
-
-        view_text = extract_first([
-            r'"viewCountText":\{"simpleText":"(.*?)"\}',
-            r'"viewCountText":\{"runs":\[\{"text":"(.*?)"\}',
-            r'"shortViewCountText":\{"simpleText":"(.*?)"\}',
-            r'"shortViewCountText":\{"runs":\[\{"text":"(.*?)"\}',
-        ], chunk)
-
-        published_label = extract_first([
-            r'"publishedTimeText":\{"simpleText":"(.*?)"\}',
-            r'"publishedTimeText":\{"runs":\[\{"text":"(.*?)"\}',
-        ], chunk)
-
-        if not title:
-            continue
-
-        candidates.append({
-            "video_id": video_id,
-            "title": title,
-            "channel": channel or "YouTube",
-            "views": parse_compact_view_count(view_text),
-            "published_label": published_label,
-            "published_month_key": estimate_published_month_key(published_label),
-            "url": f"https://www.youtube.com/watch?v={video_id}",
-        })
-
-    return candidates
-
-
-def collect_youtube_search_scrape(merchant: dict[str, Any], max_results: int = 12) -> dict[str, Any]:
-    """
-    YouTube 검색결과 HTML 비공식 수집.
-    v4: Shorts/일반영상 후보를 videoId 주변 JSON으로 재파싱하고, 제목 없는 가짜 항목을 제거합니다.
-    """
-    keywords = split_keywords(merchant.get("youtube_keywords")) or [merchant["name"]]
-    videos: dict[str, dict[str, Any]] = {}
-    raw_candidates = 0
-    filtered_out = 0
-
-    try:
-        for keyword in keywords:
-            url = f"https://www.youtube.com/results?search_query={quote_plus(keyword)}"
-            html = fetch_text(url)
-
-            candidates = extract_youtube_candidates_from_html(html)
-            raw_candidates += len(candidates)
-
-            for item in candidates:
-                video_id = item["video_id"]
-                if video_id in videos:
-                    continue
-
-                if not is_relevant_youtube_video(merchant, item["title"], item["channel"]):
-                    filtered_out += 1
-                    continue
-
-                videos[video_id] = item
-
-                if len(videos) >= max_results:
-                    break
-
-            if len(videos) >= max_results:
-                break
-
-        monthly_counts: dict[str, int] = {}
-        undated_count = 0
-        for video in videos.values():
-            key = video.get("published_month_key")
-            if key:
-                monthly_counts[key] = monthly_counts.get(key, 0) + 1
-            else:
-                undated_count += 1
-
-        top_videos = sorted(videos.values(), key=lambda x: x["views"], reverse=True)[:5]
-
-        if not videos:
-            return {
-                "status": "ok",
-                "reason": f"정확 매칭 영상 없음. 후보 {raw_candidates}건 중 {filtered_out}건 제외",
-                "youtube_count": 0,
-                "youtube_total_views": 0,
-                "monthly_youtube_counts": {},
-                "undated_count": 0,
-                "top_videos": [],
-            }
-
-        return {
-            "status": "ok",
-            "reason": f"정확 매칭+업로드월 파싱 적용. 후보 {raw_candidates}건 중 {filtered_out}건 제외, 날짜 미확인 {undated_count}건",
-            "youtube_count": len(videos),
-            "youtube_total_views": sum(v["views"] for v in videos.values()),
-            "monthly_youtube_counts": monthly_counts,
-            "undated_count": undated_count,
-            "top_videos": [
-                {
-                    "title": v["title"],
-                    "channel": v["channel"],
-                    "views": v["views"],
-                    "published": v.get("published_label", ""),
-                }
-                for v in top_videos
-            ],
-        }
-    except Exception as e:
-        return {
-            "status": "fallback",
-            "reason": f"YouTube 비공식 크롤링 오류: {str(e)[:140]}",
-            "youtube_count": None,
-            "youtube_total_views": None,
-            "monthly_youtube_counts": {},
-            "undated_count": 0,
-            "top_videos": [],
-        }
-
+def month_key_label(k: str) -> str:
+    y, m = k.split("-")
+    return f"{y}년 {int(m)}월"
 
 def resolve_final_url(url: str) -> str:
     try:
         opener = build_opener(HTTPRedirectHandler)
-        req = Request(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-                ),
-                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-            },
-        )
-        response = opener.open(req, timeout=12)
-        return response.geturl()
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        return opener.open(req, timeout=12).geturl()
     except Exception:
         return url
 
-
-def extract_naver_place_id(naver_place_url: str) -> str | None:
-    final_url = resolve_final_url(naver_place_url)
-
-    patterns = [
-        r"/place/(\d+)",
-        r"/restaurant/(\d+)",
-        r"placeId=(\d+)",
-        r"id=(\d+)",
-    ]
-
-    for pattern in patterns:
-        m = re.search(pattern, final_url)
+def extract_place_id(place_url: str) -> Optional[str]:
+    final = resolve_final_url(place_url)
+    for pat in [r"/place/(\d+)", r"/restaurant/(\d+)", r"placeId=(\d+)", r"id=(\d+)"]:
+        m = re.search(pat, final)
         if m:
             return m.group(1)
-
     return None
 
 
-def parse_naver_count(text: str) -> int:
-    if not text:
-        return 0
+# ══════════════════════════════════════════
+# 네이버 플레이스 수집 (Playwright)
+# ══════════════════════════════════════════
+def crawl_naver_place(place_id: str) -> dict:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {"status": "error", "reason": "Playwright 미설치", "receipt_items": [], "blog_items": [], "receipt_count": None, "blog_count": None}
 
-    cleaned = text.replace(",", "").replace(" ", "")
-    m = re.search(r"(\d+)", cleaned)
-    return int(m.group(1)) if m else 0
+    receipt_items, blog_items = [], []
+    receipt_count = blog_count = None
 
+    def get_blob(page) -> str:
+        parts = []
+        try: parts.append(page.inner_text("body", timeout=8000))
+        except: pass
+        for frame in page.frames:
+            try:
+                if frame == page.main_frame: continue
+                t = frame.locator("body").inner_text(timeout=3000)
+                if t and len(t) > 100: parts.append(t)
+            except: continue
+        return "\n".join(parts)
 
-def parse_korean_absolute_date(value: str) -> str | None:
-    """
-    네이버/리스틀리형 날짜를 YYYY-MM-DD로 정규화합니다.
-    지원:
-    - 2026.04.26 / 2026-04-26 / 2026년 4월 26일
-    - 25.9.18.목 / 26.4.20.월
-    - 4.20.월 / 04.20  : 연도가 없는 경우 현재 연도로 추정
-    """
-    if not value:
-        return None
+    def parse_dates(blob: str, source: str) -> list[dict]:
+        items = []
+        pats = [
+            r"20\d{2}\s*[.\-/년]\s*\d{1,2}\s*[.\-/월]\s*\d{1,2}",
+            r"2[0-9]\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}",
+            r"(?<!\d)(?:1[0-2]|[1-9])\s*\.\s*(?:3[01]|[12][0-9]|[1-9])\s*\.?(?:[월화수목금토일])?",
+        ]
+        for pat in pats:
+            for m in re.finditer(pat, blob):
+                d = parse_naver_date(m.group(0))
+                mk = date_to_month_key(d)
+                if d and mk:
+                    items.append({"date": d, "month_key": mk, "source": source})
+        return items
 
-    s = strip_html(value).replace(" ", "").replace(",", "")
-    s = s.replace("년", ".").replace("월", ".").replace("일", "")
-    s = re.sub(r"[월화수목금토일]$", "", s)
-    s = s.strip(".")
+    def scroll_and_collect(page, source: str, target: Optional[int], max_rounds: int = 120) -> list[dict]:
+        best = []
+        stable = 0
+        last_len = 0
+        for _ in range(max_rounds):
+            # 더보기 버튼 클릭
+            for sel in ["button:has-text('펼쳐서 더보기')", "button:has-text('더보기')", "[role=button]:has-text('더보기')"]:
+                try:
+                    loc = page.locator(sel)
+                    for i in range(min(loc.count(), 20)):
+                        try:
+                            it = loc.nth(i)
+                            if it.is_visible():
+                                it.scroll_into_view_if_needed(timeout=1000)
+                                it.click(timeout=1200, force=True)
+                                page.wait_for_timeout(400)
+                        except: pass
+                except: pass
 
-    def valid(y: int, m: int, d: int) -> bool:
-        return 2000 <= y <= 2099 and 1 <= m <= 12 and 1 <= d <= 31
+            page.mouse.wheel(0, 1800)
+            page.wait_for_timeout(600)
 
-    # 2026.04.26 / 2026-04-26
-    m = re.search(r"(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", s)
-    if m:
-        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if valid(y, mo, d):
-            return f"{y:04d}-{mo:02d}-{d:02d}"
+            blob = get_blob(page)
+            items = parse_dates(blob, source)
 
-    # 25.9.18 / 26.4.20
-    m = re.search(r"(?<!\d)(2[0-9])[.](\d{1,2})[.](\d{1,2})(?!\d)", s)
-    if m:
-        y, mo, d = 2000 + int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if valid(y, mo, d):
-            return f"{y:04d}-{mo:02d}-{d:02d}"
+            if len(items) > len(best):
+                best = items
 
-    # 4.20 / 04.20
-    m = re.search(r"(?<!\d)(\d{1,2})[.](\d{1,2})(?!\d)", s)
-    if m:
-        now = datetime.now()
-        y, mo, d = now.year, int(m.group(1)), int(m.group(2))
-        if valid(y, mo, d):
-            return f"{y:04d}-{mo:02d}-{d:02d}"
+            if target and len(items) >= int(target * 0.9):
+                return best[:target] if target else best
 
-    return None
+            if len(blob) <= last_len + 100 and len(items) <= len(best):
+                stable += 1
+            else:
+                stable = 0
+                last_len = max(last_len, len(blob))
 
+            if stable >= 18:
+                break
 
-def date_to_month_key(date_value: str | None) -> str | None:
-    if not date_value:
-        return None
-    m = re.search(r"(20\d{2})-(\d{2})-\d{2}", date_value)
-    if not m:
-        return None
-    return f"{m.group(1)}-{m.group(2)}"
-
-
-def distribute_items_by_month(items: list[dict[str, Any]], month_keys: list[str]) -> dict[str, int]:
-    counts = {key: 0 for key in month_keys}
-    for item in items:
-        key = item.get("month_key")
-        if key in counts:
-            counts[key] += 1
-    return counts
-
-
-def collect_naver_blog_search(merchant: dict[str, Any], max_results: int = 50) -> dict[str, Any]:
-    """
-    네이버 블로그 검색 HTML 기반 비공식 수집.
-    v2: 검색결과에서 블로그 게시일을 함께 파싱해 월별 배분에 사용합니다.
-    """
-    keywords = split_keywords(merchant.get("blog_keywords")) or [merchant["name"]]
-    posts: dict[str, dict[str, Any]] = {}
-    raw_candidates = 0
-    filtered_out = 0
-    undated_count = 0
+        return best[:target] if target else best
 
     try:
-        for keyword in keywords:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+            ctx = browser.new_context(
+                viewport={"width": 430, "height": 1500},
+                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1",
+                locale="ko-KR",
+                timezone_id="Asia/Seoul",
+            )
+            page = ctx.new_page()
+
+            # 영수증 리뷰 수집
+            for url in [
+                f"https://m.place.naver.com/restaurant/{place_id}/review/visitor?reviewSort=recent",
+                f"https://m.place.naver.com/place/{place_id}/review/visitor?reviewSort=recent",
+            ]:
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(2500)
+                    blob = get_blob(page)
+                    # 총 건수 파싱
+                    for pat in [r"방문자\s*리뷰\s*([0-9,]+)", r"영수증\s*리뷰\s*([0-9,]+)"]:
+                        mm = re.search(pat, blob)
+                        if mm:
+                            receipt_count = int(mm.group(1).replace(",", ""))
+                            break
+                    receipt_items = scroll_and_collect(page, "receipt", receipt_count, max_rounds=100)
+                    if receipt_items:
+                        break
+                except: continue
+
+            # 블로그 리뷰 수집
+            for url in [
+                f"https://m.place.naver.com/restaurant/{place_id}/review/ugc",
+                f"https://m.place.naver.com/place/{place_id}/review/ugc",
+            ]:
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(2500)
+                    blob = get_blob(page)
+                    for pat in [r"블로그\s*리뷰\s*([0-9,]+)"]:
+                        mm = re.search(pat, blob)
+                        if mm:
+                            blog_count = int(mm.group(1).replace(",", ""))
+                            break
+                    blog_items = scroll_and_collect(page, "blog", blog_count, max_rounds=60)
+                    if blog_items:
+                        break
+                except: continue
+
+            ctx.close()
+            browser.close()
+
+        return {
+            "status": "ok",
+            "receipt_count": receipt_count or len(receipt_items),
+            "blog_count": blog_count or len(blog_items),
+            "receipt_items": receipt_items,
+            "blog_items": blog_items,
+        }
+    except Exception as e:
+        return {"status": "error", "reason": str(e)[:200], "receipt_items": [], "blog_items": [], "receipt_count": None, "blog_count": None}
+
+
+# ══════════════════════════════════════════
+# 네이버 블로그 수집
+# ══════════════════════════════════════════
+def crawl_naver_blog(keywords: list[str], max_results: int = 50) -> dict:
+    posts = {}
+    undated = 0
+
+    for keyword in keywords:
+        try:
             url = f"https://search.naver.com/search.naver?where=blog&query={quote_plus(keyword)}"
             html = fetch_text(url)
 
-            # 검색 결과 블록 단위 후보. 네이버 구조 변경에 대비해 링크 기준으로 주변 chunk를 잘라 파싱
-            for link_match in re.finditer(r'href="(https://blog\.naver\.com/[^"]+)"', html):
-                link = link_match.group(1)
-                raw_candidates += 1
-
+            for link_m in re.finditer(r'href="(https://blog\.naver\.com/[^"]+)"', html):
+                link = link_m.group(1)
                 if link in posts:
                     continue
 
-                chunk_start = max(0, link_match.start() - 2500)
-                chunk_end = min(len(html), link_match.end() + 3500)
-                chunk = html[chunk_start:chunk_end]
+                chunk_s = max(0, link_m.start() - 2500)
+                chunk_e = min(len(html), link_m.end() + 3500)
+                chunk = html[chunk_s:chunk_e]
 
-                title = extract_first([
-                    r'class="[^"]*(?:title_link|api_txt_lines)[^"]*"[^>]*>(.*?)</a>',
-                    r'<a[^>]+href="' + re.escape(link) + r'"[^>]*>(.*?)</a>',
-                ], chunk)
+                title = ""
+                for pat in [r'class="[^"]*title_link[^"]*"[^>]*>(.*?)</a>', r'class="[^"]*api_txt_lines[^"]*"[^>]*>(.*?)</span>']:
+                    mm = re.search(pat, chunk, re.S)
+                    if mm:
+                        title = strip_html(mm.group(1))
+                        break
 
-                date_raw = extract_first([
-                    r'class="[^"]*(?:sub_time|date|time|etc_dsc_area)[^"]*"[^>]*>(.*?)</span>',
-                    r'(\d{4}\.\d{1,2}\.\d{1,2}\.?)',
-                    r'(\d{4}-\d{1,2}-\d{1,2})',
-                    r'(\d{1,2}\.\d{1,2}\.?)',
-                ], chunk)
+                date_raw = ""
+                for pat in [r"(\d{4}\.\d{1,2}\.\d{1,2}\.?)", r"(2[0-9]\.\d{1,2}\.\d{1,2})"]:
+                    mm = re.search(pat, chunk)
+                    if mm:
+                        date_raw = mm.group(1)
+                        break
 
-                published_date = parse_korean_absolute_date(date_raw)
-                month_key = date_to_month_key(published_date)
-
-                combined = normalize_text(title + " " + link)
-                merchant_name = normalize_text(merchant["name"])
-
-                relevant = merchant_name in combined if merchant_name else False
-                if not relevant:
-                    for keyword_check in keywords:
-                        if normalize_text(keyword_check) in combined:
-                            relevant = True
-                            break
-
-                if not relevant:
-                    filtered_out += 1
-                    continue
-
-                if not month_key:
-                    undated_count += 1
+                d = parse_naver_date(date_raw)
+                mk = date_to_month_key(d)
+                if not mk:
+                    undated += 1
 
                 posts[link] = {
-                    "title": title or merchant["name"] + " 관련 블로그",
                     "url": link,
-                    "published_date": published_date,
-                    "month_key": month_key,
-                    "source": "naver_blog",
+                    "title": title or f"{keyword} 블로그",
+                    "date": d,
+                    "month_key": mk,
+                    "keyword": keyword,
                 }
 
                 if len(posts) >= max_results:
                     break
 
-            if len(posts) >= max_results:
-                break
-
-        items = list(posts.values())
-        return {
-            "status": "ok",
-            "reason": f"네이버 블로그 검색 수집. 후보 {raw_candidates}건 중 {filtered_out}건 제외, 날짜 미확인 {undated_count}건",
-            "count": len(items),
-            "items": items[:20],
-            "undated_count": undated_count,
-        }
-    except Exception as e:
-        return {
-            "status": "fallback",
-            "reason": f"네이버 블로그 수집 오류: {str(e)[:140]}",
-            "count": None,
-            "items": [],
-            "undated_count": 0,
-        }
-
-
-def extract_review_counts_from_text(page_text: str) -> tuple[int | None, int | None]:
-    receipt_count = None
-    blog_count = None
-
-    receipt_patterns = [
-        r"방문자\s*리뷰\s*([0-9,]+)",
-        r"방문자리뷰\s*([0-9,]+)",
-        r"영수증\s*리뷰\s*([0-9,]+)",
-        r"영수증리뷰\s*([0-9,]+)",
-    ]
-    blog_patterns = [
-        r"블로그\s*리뷰\s*([0-9,]+)",
-        r"블로그리뷰\s*([0-9,]+)",
-    ]
-
-    for pattern in receipt_patterns:
-        m = re.search(pattern, page_text)
-        if m:
-            receipt_count = parse_naver_count(m.group(1))
-            break
-
-    for pattern in blog_patterns:
-        m = re.search(pattern, page_text)
-        if m:
-            blog_count = parse_naver_count(m.group(1))
-            break
-
-    return receipt_count, blog_count
-
-
-def parse_review_dates_from_blob(blob: str, source: str, max_items: int = 3000) -> list[dict[str, Any]]:
-    """
-    body text + rendered html 전체에서 리뷰 날짜를 추출합니다.
-    같은 날짜에 여러 리뷰가 있으면 중복 카운트해야 하므로 dedupe하지 않습니다.
-    """
-    if not blob:
-        return []
-
-    # HTML entity/태그 노이즈 완화
-    normalized = unescape(blob)
-    normalized = normalized.replace("\\u002E", ".").replace("\\/", "/")
-
-    items: list[dict[str, Any]] = []
-
-    patterns = [
-        # 2026. 4. 20. / 2026-04-20
-        r"20\d{2}\s*[.\-/년]\s*\d{1,2}\s*[.\-/월]\s*\d{1,2}\.?",
-        # 25.9.18. / 25. 9. 18.
-        r"2[0-9]\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\.?",
-        # 4.20.월 / 4.20
-        r"(?<!\d)(?:1[0-2]|[1-9])\s*\.\s*(?:3[01]|[12][0-9]|[1-9])\s*\.?(?:[월화수목금토일])?",
-    ]
-
-    for pattern in patterns:
-        for m in re.finditer(pattern, normalized):
-            raw = m.group(0)
-            parsed_date = parse_korean_absolute_date(raw)
-            month_key = date_to_month_key(parsed_date)
-            if not parsed_date or not month_key:
-                continue
-            items.append({
-                "published_date": parsed_date,
-                "month_key": month_key,
-                "source": source,
-            })
-            if len(items) >= max_items:
-                return items
-
-    return items
-
-
-def cap_items_to_total(items: list[dict[str, Any]], target_count: int | None) -> list[dict[str, Any]]:
-    """
-    날짜 후보가 표시 총 리뷰 수보다 과도하게 많으면 중복 파싱으로 판단하고 총 리뷰 수로 상한 처리합니다.
-    네이버 리뷰는 최신순으로 수집하므로 앞쪽 데이터부터 유지합니다.
-    """
-    if not target_count or target_count <= 0:
-        return items
-
-    if len(items) <= target_count:
-        return items
-
-    return items[:target_count]
-
-
-def safe_click_by_text(page, labels: list[str]) -> bool:
-    """
-    네이버 플레이스 리뷰에서 '펼쳐서 더보기' / '더보기' / 아래화살표형 버튼을 최대한 클릭합니다.
-    """
-    clicked_any = False
-
-    selectors = [
-        "button:has-text('펼쳐서 더보기')",
-        "button:has-text('더보기')",
-        "button:has-text('리뷰 더보기')",
-        "button:has-text('펼쳐보기')",
-        "a:has-text('펼쳐서 더보기')",
-        "a:has-text('더보기')",
-        "[role=button]:has-text('펼쳐서 더보기')",
-        "[role=button]:has-text('더보기')",
-        "[aria-label*='더보기']",
-        "[aria-label*='펼치']",
-    ]
-
-    for label in labels:
-        selectors.extend([
-            f"text={label}",
-            f"button:has-text('{label}')",
-            f"a:has-text('{label}')",
-            f"[role=button]:has-text('{label}')",
-        ])
-
-    for selector in selectors:
-        try:
-            loc = page.locator(selector)
-            count = min(loc.count(), 25)
-            for i in range(count):
-                try:
-                    item = loc.nth(i)
-                    if item.is_visible():
-                        item.scroll_into_view_if_needed(timeout=1000)
-                        page.wait_for_timeout(120)
-                        item.click(timeout=1200, force=True)
-                        page.wait_for_timeout(450)
-                        clicked_any = True
-                except Exception:
-                    continue
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[Blog] 키워드 수집 실패 '{keyword}': {e}")
             continue
 
-    return clicked_any
-
-
-def click_expand_buttons_repeatedly(page, rounds: int = 4) -> int:
-    click_count = 0
-    for _ in range(rounds):
-        before = click_count
-        if safe_click_by_text(page, ["펼쳐서 더보기", "더보기", "리뷰 더보기", "펼쳐보기", "전체보기"]):
-            click_count += 1
-        page.wait_for_timeout(300)
-        if click_count == before:
-            break
-    return click_count
-
-
-def get_page_blob(page) -> str:
-    """
-    rendered HTML까지 섞으면 같은 리뷰 날짜가 script/json/DOM에 반복 포함되어
-    월별 건수가 수천 건으로 뻥튀기될 수 있습니다.
-    따라서 기본 수집은 실제 화면 텍스트(inner_text)만 사용합니다.
-    """
-    parts = []
-    try:
-        parts.append(page.inner_text("body", timeout=8000))
-    except Exception:
-        pass
-
-    try:
-        for frame in page.frames:
-            try:
-                if frame == page.main_frame:
-                    continue
-                frame_text = frame.locator("body").inner_text(timeout=3000)
-                if frame_text and len(frame_text) > 100:
-                    parts.append(frame_text)
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return "\n".join([p for p in parts if p])
-
-
-def scroll_until_review_count_target(page, target_count: int | None, source: str, max_rounds: int = 260) -> tuple[str, list[dict[str, Any]]]:
-    """
-    리뷰 카드 로딩 + '펼쳐서 더보기' 버튼 클릭을 함께 수행합니다.
-    """
-    last_blob_len = 0
-    last_item_count = 0
-    stable = 0
-    best_blob = ""
-    best_items: list[dict[str, Any]] = []
-
-    for _ in range(max_rounds):
-        try:
-            click_expand_buttons_repeatedly(page, rounds=3)
-        except Exception:
-            pass
-
-        try:
-            page.mouse.wheel(0, 1800)
-            page.wait_for_timeout(500)
-            click_expand_buttons_repeatedly(page, rounds=2)
-            page.mouse.wheel(0, 1800)
-            page.wait_for_timeout(500)
-        except Exception:
-            pass
-
-        blob = get_page_blob(page)
-        items = parse_review_dates_from_blob(blob, source=source, max_items=5000)
-
-        if len(items) > len(best_items):
-            best_items = items
-            best_blob = blob
-
-        if target_count and len(items) >= int(target_count * 0.95):
-            return blob, cap_items_to_total(items, target_count)
-
-        blob_len = len(blob)
-        item_count = len(items)
-
-        if blob_len <= last_blob_len + 80 and item_count <= last_item_count:
-            stable += 1
-        else:
-            stable = 0
-            last_blob_len = max(last_blob_len, blob_len)
-            last_item_count = max(last_item_count, item_count)
-
-        if stable >= 22:
-            break
-
-    return best_blob, cap_items_to_total(best_items, target_count)
-
-
-def collect_naver_tab(page, urls: list[str], source: str, max_rounds: int = 220) -> dict[str, Any]:
-    best = {
-        "blob": "",
-        "items": [],
-        "receipt_count": None,
-        "blog_count": None,
-        "url": "",
+    items = list(posts.values())
+    return {
+        "status": "ok",
+        "count": len(items),
+        "undated_count": undated,
+        "items": items,
     }
 
-    for url in urls:
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=35000)
-            page.wait_for_timeout(2500)
-            safe_click_by_text(page, ["확인", "닫기", "나중에", "취소"])
 
-            initial_blob = get_page_blob(page)
-            receipt_count, blog_count = extract_review_counts_from_text(initial_blob)
-            target_count = receipt_count if source == "naver_place_receipt" else blog_count
+# ══════════════════════════════════════════
+# 유튜브 수집 (HTML 비공식)
+# ══════════════════════════════════════════
+def parse_youtube_published(label: str) -> Optional[str]:
+    if not label:
+        return None
+    text = label.strip().lower()
+    now = datetime.now()
+    m = re.search(r"(\d+)\s*(초|분|시간|일|주|개월|달|년)", text)
+    if m:
+        v, u = int(m.group(1)), m.group(2)
+        if u in ("일",): dt = now - timedelta(days=v)
+        elif u in ("주",): dt = now - timedelta(weeks=v)
+        elif u in ("개월", "달"):
+            mo = now.month - v; yr = now.year
+            while mo <= 0: mo += 12; yr -= 1
+            dt = now.replace(year=yr, month=mo)
+        elif u in ("년",): dt = now.replace(year=now.year - v)
+        else: dt = now
+        return f"{dt.year}-{dt.month:02d}"
+    m = re.search(r"(\d+)\s*(day|week|month|year)s?\s+ago", text)
+    if m:
+        v, u = int(m.group(1)), m.group(2)
+        if u == "day": dt = now - timedelta(days=v)
+        elif u == "week": dt = now - timedelta(weeks=v)
+        elif u == "month":
+            mo = now.month - v; yr = now.year
+            while mo <= 0: mo += 12; yr -= 1
+            dt = now.replace(year=yr, month=mo)
+        elif u == "year": dt = now.replace(year=now.year - v)
+        else: dt = now
+        return f"{dt.year}-{dt.month:02d}"
+    return None
 
-            blob, items = scroll_until_review_count_target(
-                page,
-                target_count=target_count,
-                source=source,
-                max_rounds=max_rounds,
-            )
+def crawl_youtube(merchant: dict, max_results: int = 12) -> dict:
+    keywords = merchant.get("youtube_keywords", []) or [merchant["name"]]
+    name_norm = re.sub(r"[^0-9a-zA-Z가-힣]", "", merchant["name"]).lower()
+    videos = {}
 
-            # 스크롤 후 카운트 재확인
-            final_receipt_count, final_blog_count = extract_review_counts_from_text(blob)
-            receipt_count = final_receipt_count or receipt_count
-            blog_count = final_blog_count or blog_count
+    try:
+        for keyword in keywords:
+            url = f"https://www.youtube.com/results?search_query={quote_plus(keyword)}"
+            html = fetch_text(url, timeout=20)
 
-            if len(items) > len(best["items"]) or len(blob) > len(best["blob"]):
-                best = {
-                    "blob": blob,
-                    "items": items,
-                    "receipt_count": receipt_count,
-                    "blog_count": blog_count,
-                    "url": url,
+            for vm in re.finditer(r'"videoId":"([^"]{8,20})"', html):
+                vid = vm.group(1)
+                if vid in videos:
+                    continue
+
+                s = max(0, vm.start() - 3500)
+                e = min(len(html), vm.end() + 6500)
+                chunk = html[s:e]
+
+                def ex(pats):
+                    for p in pats:
+                        mm = re.search(p, chunk, re.S)
+                        if mm:
+                            return strip_html(mm.group(1))
+                    return ""
+
+                title = ex([r'"title":\{"runs":\[\{"text":"(.*?)"', r'"title":\{"simpleText":"(.*?)"'])
+                channel = ex([r'"ownerText":\{"runs":\[\{"text":"(.*?)"', r'"shortBylineText":\{"runs":\[\{"text":"(.*?)"'])
+                view_text = ex([r'"viewCountText":\{"simpleText":"(.*?)"', r'"shortViewCountText":\{"simpleText":"(.*?)"'])
+                published_label = ex([r'"publishedTimeText":\{"simpleText":"(.*?)"'])
+
+                if not title:
+                    continue
+
+                title_norm = re.sub(r"[^0-9a-zA-Z가-힣]", "", title).lower()
+                channel_norm = re.sub(r"[^0-9a-zA-Z가-힣]", "", channel).lower()
+                combined = title_norm + channel_norm
+                kw_norms = [re.sub(r"[^0-9a-zA-Z가-힣]", "", k).lower() for k in keywords]
+
+                relevant = name_norm in combined or any(k in combined for k in kw_norms if k)
+                if not relevant:
+                    continue
+
+                # 조회수 파싱
+                views = 0
+                vm2 = re.search(r"([\d.]+)(만|천|K|M)?", view_text.replace(",", ""), re.I)
+                if vm2:
+                    num = float(vm2.group(1))
+                    u = (vm2.group(2) or "").lower()
+                    if u == "만": num *= 10000
+                    elif u == "천": num *= 1000
+                    elif u == "k": num *= 1000
+                    elif u == "m": num *= 1000000
+                    views = int(num)
+
+                videos[vid] = {
+                    "video_id": vid,
+                    "title": title,
+                    "channel": channel or "YouTube",
+                    "views": views,
+                    "published_label": published_label,
+                    "month_key": parse_youtube_published(published_label),
+                    "url": f"https://www.youtube.com/watch?v={vid}",
                 }
-        except Exception:
-            continue
 
-    return best
-
-
-def crawl_naver_place_with_playwright(place_id: str, max_clicks: int = 220) -> dict[str, Any]:
-    """
-    네이버 플레이스 리뷰 정밀 수집 v4.
-    - visitor / ugc 탭 분리
-    - body text + rendered HTML + iframe content 병합
-    - 같은 날짜 중복 카운트 유지
-    - 표시 총 리뷰 수에 근접할 때까지 스크롤
-    """
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as e:
-        return {
-            "status": "fallback",
-            "reason": f"Playwright import 실패: {str(e)[:120]}",
-            "place_receipt_count": None,
-            "place_blog_count": None,
-            "receipt_items": [],
-            "place_blog_items": [],
-        }
-
-    visitor_urls = [
-        f"https://m.place.naver.com/restaurant/{place_id}/review/visitor?reviewSort=recent",
-        f"https://m.place.naver.com/place/{place_id}/review/visitor?reviewSort=recent",
-        f"https://m.place.naver.com/restaurant/{place_id}/review/visitor",
-        f"https://m.place.naver.com/place/{place_id}/review/visitor",
-    ]
-    blog_urls = [
-        f"https://m.place.naver.com/restaurant/{place_id}/review/ugc",
-        f"https://m.place.naver.com/place/{place_id}/review/ugc",
-        f"https://m.place.naver.com/restaurant/{place_id}/review/blog",
-        f"https://m.place.naver.com/place/{place_id}/review/blog",
-    ]
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-            context = browser.new_context(
-                viewport={"width": 430, "height": 1500},
-                user_agent=(
-                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-                    "Mobile/15E148 Safari/604.1"
-                ),
-                locale="ko-KR",
-                timezone_id="Asia/Seoul",
-                extra_http_headers={
-                    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Referer": "https://m.place.naver.com/",
-                },
-            )
-            page = context.new_page()
-
-            visitor = collect_naver_tab(page, visitor_urls, source="naver_place_receipt", max_rounds=max_clicks)
-            blog = collect_naver_tab(page, blog_urls, source="naver_place_blog", max_rounds=max(80, max_clicks // 2))
-
-            receipt_count = visitor.get("receipt_count")
-            blog_count = blog.get("blog_count")
-
-            raw_receipt_items = visitor.get("items", [])
-            raw_place_blog_items = blog.get("items", [])
-
-            # 방문자 리뷰는 날짜가 충분히 파싱되면 날짜 기반 건수를 우선합니다.
-            # 네이버 헤더 카운트가 전체 누적/비공개 포함 등으로 실제 로딩 리뷰 수와 다를 수 있기 때문입니다.
-            if len(raw_receipt_items) >= 30:
-                receipt_count = len(raw_receipt_items)
-
-            receipt_items = cap_items_to_total(raw_receipt_items, receipt_count)
-            place_blog_items = cap_items_to_total(raw_place_blog_items, blog_count)
-
-            context.close()
-            browser.close()
-
-            return {
-                "status": "ok",
-                "reason": (
-                    f"Playwright v8 expand-button+full-scroll 수집 완료. "
-                    f"receipt_count={receipt_count}, receipt_dates={len(receipt_items)}, "
-                    f"blog_count={blog_count}, blog_dates={len(place_blog_items)}, "
-                    f"visitor_url={visitor.get('url','')}, blog_url={blog.get('url','')}"
-                ),
-                "place_receipt_count": receipt_count,
-                "place_blog_count": blog_count,
-                "receipt_items": receipt_items,
-                "place_blog_items": place_blog_items,
-            }
-    except Exception as e:
-        return {
-            "status": "fallback",
-            "reason": f"Playwright 네이버 플레이스 수집 실패: {str(e)[:180]}",
-            "place_receipt_count": None,
-            "place_blog_count": None,
-            "receipt_items": [],
-            "place_blog_items": [],
-        }
-
-
-def collect_naver_place_review_counts(merchant: dict[str, Any], max_items: int = 300) -> dict[str, Any]:
-    """
-    네이버 플레이스 리뷰 수집 v4.
-    Playwright 기반 실제 페이지 수집을 우선 사용하고, 실패 시 requests HTML fallback을 사용합니다.
-    """
-    place_url = merchant.get("naver_place_url", "")
-    place_id = extract_naver_place_id(place_url)
-
-    if not place_id:
-        return {
-            "status": "fallback",
-            "reason": "네이버 플레이스 ID 추출 실패",
-            "place_id": None,
-            "place_receipt_count": None,
-            "place_blog_count": None,
-            "receipt_items": [],
-            "place_blog_items": [],
-        }
-
-    pw_result = crawl_naver_place_with_playwright(place_id, max_clicks=85)
-    if pw_result["status"] == "ok":
-        pw_result["place_id"] = place_id
-        return pw_result
-
-    candidate_urls = [
-        f"https://m.place.naver.com/restaurant/{place_id}/home",
-        f"https://m.place.naver.com/place/{place_id}/home",
-        f"https://m.place.naver.com/restaurant/{place_id}/review/visitor",
-        f"https://m.place.naver.com/place/{place_id}/review/visitor",
-        f"https://m.place.naver.com/restaurant/{place_id}/review/ugc",
-        f"https://m.place.naver.com/place/{place_id}/review/ugc",
-    ]
-
-    try:
-        merged = ""
-        for url in candidate_urls:
-            try:
-                merged += "\n" + fetch_text(url)
-            except Exception:
-                continue
-
-        if not merged.strip():
-            return {
-                "status": "fallback",
-                "reason": pw_result["reason"] + " / requests 페이지 접근 실패",
-                "place_id": place_id,
-                "place_receipt_count": None,
-                "place_blog_count": None,
-                "receipt_items": [],
-                "place_blog_items": [],
-            }
-
-        clean_text = strip_html(merged)
-        receipt_count, blog_count = extract_review_counts_from_text(clean_text)
-
-        if receipt_count is None:
-            for pattern in [r'"visitorReviewCount"\s*:\s*([0-9]+)', r'"reviewCount"\s*:\s*([0-9]+)']:
-                m = re.search(pattern, merged)
-                if m:
-                    receipt_count = parse_naver_count(m.group(1))
+                if len(videos) >= max_results:
                     break
 
-        if blog_count is None:
-            m = re.search(r'"blogReviewCount"\s*:\s*([0-9]+)', merged)
-            if m:
-                blog_count = parse_naver_count(m.group(1))
+        monthly_counts: dict[str, int] = {}
+        undated = 0
+        for v in videos.values():
+            k = v.get("month_key")
+            if k:
+                monthly_counts[k] = monthly_counts.get(k, 0) + 1
+            else:
+                undated += 1
 
-        receipt_items = parse_review_text_blocks(clean_text, "naver_place_receipt", max_items=max_items)
-
-        status_value = "ok" if receipt_count is not None or blog_count is not None else "fallback"
-        reason = (
-            f"requests HTML fallback 수집 완료. Playwright 실패 사유: {pw_result['reason']}. 날짜 후보 {len(receipt_items)}건"
-            if status_value == "ok"
-            else "리뷰 카운트 파싱 실패"
-        )
+        top = sorted(videos.values(), key=lambda x: x["views"], reverse=True)[:5]
+        total_views = sum(v["views"] for v in videos.values())
 
         return {
-            "status": status_value,
-            "reason": reason,
-            "place_id": place_id,
-            "place_receipt_count": receipt_count,
-            "place_blog_count": blog_count,
-            "receipt_items": receipt_items,
-            "place_blog_items": [],
+            "status": "ok",
+            "youtube_count": len(videos),
+            "youtube_total_views": total_views,
+            "monthly_counts": monthly_counts,
+            "undated_count": undated,
+            "top_videos": [{"title": v["title"], "channel": v["channel"], "views": v["views"], "published": v.get("published_label", "")} for v in top],
         }
     except Exception as e:
-        return {
-            "status": "fallback",
-            "reason": f"네이버 플레이스 리뷰 수집 오류: {str(e)[:140]}",
-            "place_id": place_id,
-            "place_receipt_count": None,
-            "place_blog_count": None,
-            "receipt_items": [],
-            "place_blog_items": [],
-        }
+        return {"status": "error", "reason": str(e)[:200], "youtube_count": 0, "youtube_total_views": 0, "monthly_counts": {}, "undated_count": 0, "top_videos": []}
 
 
-def distribute_total_to_recent_months(total: int, month_count: int) -> list[int]:
-    """
-    실제 월별 게시일을 안정적으로 확보하지 못하는 채널의 임시 배분 로직.
-    총량은 실제 수집값을 쓰고, 월별은 최근월 가중치로 분배합니다.
-    """
-    if month_count <= 0:
-        return []
-
-    if total <= 0:
-        return [0] * month_count
-
-    weights = list(range(1, month_count + 1))
-    weight_sum = sum(weights)
-    values = [int(total * w / weight_sum) for w in weights]
-    diff = total - sum(values)
-    values[-1] += diff
-    return values
-
-
-def make_base_sample_data(name: str) -> dict[str, Any]:
-    sample_data = {
-        "배포차": {
-            "monthly": [(18, 42, 9, 5, 6), (22, 57, 11, 7, 7), (29, 66, 13, 8, 10), (34, 88, 17, 10, 11)],
-            "summary": {"total_mentions": 470, "naver_blog_count": 103, "instagram_count": 253, "place_receipt_count": 50, "place_blog_count": 30, "youtube_total_views": 264000, "ad_ratio": 62, "self_ratio": 23},
-            "videos": [("신사역 배포차 방문 후기", "맛집탐방러", 128000), ("가로수길 술집 추천 배포차", "서울먹방일기", 84600)],
-        },
-        "소요": {
-            "monthly": [(9, 18, 4, 3, 2), (13, 22, 5, 4, 2), (16, 27, 7, 5, 3), (21, 34, 8, 6, 3)],
-            "summary": {"total_mentions": 192, "naver_blog_count": 59, "instagram_count": 101, "place_receipt_count": 24, "place_blog_count": 18, "youtube_total_views": 72000, "ad_ratio": 38, "self_ratio": 31},
-            "videos": [("일산 소요 이자카야 방문 후기", "일산맛집노트", 31800), ("장항동 술집 소요 추천", "고양먹방채널", 24700)],
-        },
-        "순자매감자탕": {
-            "monthly": [(6, 8, 5, 2, 1), (8, 11, 6, 2, 1), (10, 14, 8, 3, 2), (13, 18, 9, 4, 2)],
-            "summary": {"total_mentions": 133, "naver_blog_count": 37, "instagram_count": 51, "place_receipt_count": 28, "place_blog_count": 11, "youtube_total_views": 38000, "ad_ratio": 24, "self_ratio": 42},
-            "videos": [("순자매감자탕 동탄 방문 후기", "동탄맛집리뷰", 18600), ("화성 감자탕 맛집 추천", "경기맛집지도", 12400)],
-        },
-        "연탄김평선": {
-            "monthly": [(7, 12, 4, 2, 1), (9, 16, 5, 3, 2), (12, 22, 6, 3, 2), (15, 28, 7, 4, 3)],
-            "summary": {"total_mentions": 146, "naver_blog_count": 43, "instagram_count": 78, "place_receipt_count": 22, "place_blog_count": 12, "youtube_total_views": 56000, "ad_ratio": 29, "self_ratio": 36},
-            "videos": [("연탄김평선 선릉 맛집 후기", "강남맛집기록", 22100), ("선릉 고기집 연탄김평선", "퇴근후한끼", 19300)],
-        },
-        "라이브볼": {
-            "monthly": [(5, 9, 3, 1, 1), (7, 12, 4, 2, 1), (9, 15, 5, 2, 2), (11, 19, 6, 3, 2)],
-            "summary": {"total_mentions": 104, "naver_blog_count": 32, "instagram_count": 55, "place_receipt_count": 18, "place_blog_count": 8, "youtube_total_views": 41000, "ad_ratio": 33, "self_ratio": 28},
-            "videos": [("라이브볼 역삼점 방문 후기", "역삼맛집로그", 17500), ("역삼역 라이브볼 분위기 리뷰", "강남데이트코스", 14200)],
-        },
-    }
-    return sample_data.get(name, sample_data["배포차"])
-
-
-def expand_monthly(base_rows: list[tuple[int, int, int, int, int]], months: int) -> list[tuple[int, int, int, int, int]]:
-    if months <= len(base_rows):
-        return base_rows[-months:]
-
-    rows = list(base_rows)
-    while len(rows) < months:
-        last = rows[-1]
-        growth = 1.06 + (len(rows) % 3) * 0.02
-        rows.append(tuple(max(1, int(v * growth)) for v in last))
-    return rows[-months:]
-
-
-
-def force_monthly_channel_total(
-    monthly: list[dict[str, Any]],
-    field: str,
-    expected_total: int | None,
-    reason_prefix: str = "",
-) -> str:
-    """
-    최종 안전장치:
-    월별 합계가 요약 총량보다 크면 초과분을 임의 배분하지 않고 최신월부터 차감해 총량과 일치시킵니다.
-    총량보다 작으면 부족분을 채우지 않습니다. 부족분 보정은 실제 날짜가 아니기 때문입니다.
-    """
-    if expected_total is None:
-        return ""
-
-    expected_total = int(expected_total)
-    current_total = sum(int(row.get(field, 0) or 0) for row in monthly)
-
-    if current_total <= expected_total:
-        return ""
-
-    excess = current_total - expected_total
-    for row in reversed(monthly):
-        value = int(row.get(field, 0) or 0)
-        if value <= 0:
-            continue
-        cut = min(value, excess)
-        row[field] = value - cut
-        excess -= cut
-        if excess <= 0:
-            break
-
-    return f"{reason_prefix} 월별 합계 {current_total}건이 총량 {expected_total}건을 초과하여 초과분만 차감"
-
-
-
-CRAWL_JOBS: dict[str, dict[str, Any]] = {}
-CRAWL_TIMEOUT_SECONDS = int(os.getenv("CRAWL_TIMEOUT_SECONDS", "300"))
-
-
-def now_iso() -> str:
-    return datetime.now(timezone(timedelta(hours=9))).isoformat()
-
-
-def run_with_timeout(fn, timeout_seconds: int):
-    """
-    크롤링 무한 대기 방지용 timeout wrapper.
-    timeout이 발생하면 API는 즉시 실패 상태를 반환하고, 프론트는 종료 상태를 알 수 있습니다.
-    """
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(fn)
-        return future.result(timeout=timeout_seconds)
-
-
-def validate_report_result(report: dict[str, Any] | None) -> tuple[bool, list[str]]:
-    """
-    수집 결과 검증.
-    - 리포트 존재
-    - 월별 데이터 존재
-    - 월별 합계와 요약값의 과도한 불일치 방지
-    """
-    errors: list[str] = []
-
-    if not report:
-        return False, ["리포트 결과가 생성되지 않았습니다."]
-
-    monthly = report.get("monthly_summary") or []
-    summary = report.get("summary") or {}
-
-    if not monthly:
-        errors.append("월별 상세 데이터가 없습니다.")
-
-    checks = [
-        ("place_receipt_count", "영수증 리뷰"),
-        ("place_blog_count", "플레이스 블로그 리뷰"),
-        ("naver_blog_count", "네이버 블로그"),
-    ]
-
-    for summary_key, label in checks:
-        if summary_key not in summary:
-            continue
-
-        if summary_key == "naver_blog_count":
-            monthly_key = "blog_count"
-        else:
-            monthly_key = summary_key
-
-        monthly_sum = sum(int(row.get(monthly_key, 0) or 0) for row in monthly)
-        summary_total = int(summary.get(summary_key, 0) or 0)
-
-        # 월별 합계가 요약보다 20% 이상 크면 중복 파싱 가능성이 큼
-        if summary_total > 0 and monthly_sum > int(summary_total * 1.2):
-            errors.append(f"{label} 월별 합계({monthly_sum})가 요약 총량({summary_total})보다 과도하게 큽니다.")
-
-    return len(errors) == 0, errors
-
-
-def set_job_status(job_id: str, **updates) -> None:
-    job = CRAWL_JOBS.get(job_id, {})
-    job.update(updates)
-    job["updated_at"] = now_iso()
-    CRAWL_JOBS[job_id] = job
-
-def make_sample_report(
-    merchant: dict[str, Any],
-    period: str = "최근 6개월",
-    start_date: str | None = None,
-    end_date: str | None = None,
-    use_live_youtube: bool = False,
-    use_live_naver: bool = False,
-) -> dict[str, Any]:
-    name = merchant["name"]
-    data = make_base_sample_data(name)
-
+# ══════════════════════════════════════════
+# 리포트 생성 (실제 수집 데이터 통합)
+# ══════════════════════════════════════════
+def build_report(merchant: dict, period: str = "최근 6개월",
+                 start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
     month_count = get_month_count(period)
-    if period in ("custom", "기간 설정"):
-        month_count = 6
+    month_keys = build_month_keys(month_count)
 
-    month_keys = build_recent_month_keys(month_count)
-    monthly_rows = expand_monthly(data["monthly"], month_count)
+    # ── 수집 실행 ──
+    logger.info(f"[Collect] {merchant['name']} 수집 시작")
+
+    # 1) 네이버 블로그
+    blog_result = crawl_naver_blog(merchant.get("blog_keywords", []))
+    logger.info(f"[Collect] 블로그: {blog_result['count']}건")
+
+    # 2) 네이버 플레이스
+    place_id = extract_place_id(merchant.get("naver_place_url", ""))
+    place_result = {"status": "skip", "receipt_count": 0, "blog_count": 0, "receipt_items": [], "blog_items": []}
+    if place_id:
+        place_result = crawl_naver_place(place_id)
+        logger.info(f"[Collect] 플레이스 영수증:{place_result.get('receipt_count')} 블로그:{place_result.get('blog_count')}")
+
+    # 3) 유튜브
+    yt_result = crawl_youtube(merchant)
+    logger.info(f"[Collect] 유튜브: {yt_result['youtube_count']}건, 조회수:{yt_result['youtube_total_views']}")
+
+    # ── 월별 집계 (작성일 기준) ──
+    def dist_by_month(items: list[dict]) -> dict[str, int]:
+        counts = defaultdict(int)
+        for item in items:
+            mk = item.get("month_key")
+            if mk and mk in month_keys:
+                counts[mk] += 1
+        return dict(counts)
+
+    blog_monthly    = dist_by_month(blog_result.get("items", []))
+    receipt_monthly = dist_by_month(place_result.get("receipt_items", []))
+    place_blog_monthly = dist_by_month(place_result.get("blog_items", []))
+    yt_monthly      = dict(yt_result.get("monthly_counts", {}))
+
+    # undated 유튜브는 최신월 배정
+    yt_undated = int(yt_result.get("undated_count", 0))
+    if yt_undated and month_keys:
+        yt_monthly[month_keys[-1]] = yt_monthly.get(month_keys[-1], 0) + yt_undated
+
+    # undated 블로그는 최신월 배정
+    blog_total  = blog_result.get("count", 0) or 0
+    blog_dated  = sum(blog_monthly.get(k, 0) for k in month_keys)
+    blog_undated = max(0, blog_total - blog_dated)
+    if blog_undated and month_keys:
+        blog_monthly[month_keys[-1]] = blog_monthly.get(month_keys[-1], 0) + blog_undated
+
+    # 월별 행 생성
     monthly = []
-    for i, row in enumerate(monthly_rows):
-        blog, insta, receipt, place_blog, youtube = row
+    for mk in month_keys:
+        blog_c    = blog_monthly.get(mk, 0)
+        insta_c   = 0  # 인스타 추후 구현
+        receipt_c = receipt_monthly.get(mk, 0)
+        pblog_c   = place_blog_monthly.get(mk, 0)
+        yt_c      = yt_monthly.get(mk, 0)
+        total     = blog_c + insta_c + receipt_c + pblog_c + yt_c
+
         monthly.append({
-            "month": month_key_to_label(month_keys[i]),
-            "month_key": month_keys[i],
-            "blog_count": blog,
-            "instagram_count": insta,
-            "place_receipt_count": receipt,
-            "place_blog_count": place_blog,
-            "youtube_count": youtube,
-            "total_count": blog + insta + receipt + place_blog + youtube,
+            "month":               month_key_label(mk),
+            "month_key":           mk,
+            "blog_count":          blog_c,
+            "instagram_count":     insta_c,
+            "place_receipt_count": receipt_c,
+            "place_blog_count":    pblog_c,
+            "youtube_count":       yt_c,
+            "total_count":         total,
         })
 
+    # 일별 집계
+    daily_raw: dict[str, dict] = defaultdict(lambda: {"blog": 0, "instagram": 0, "place_receipt": 0, "place_blog": 0, "youtube": 0})
+    for item in blog_result.get("items", []):
+        if item.get("date"):
+            daily_raw[item["date"]]["blog"] += 1
+    for item in place_result.get("receipt_items", []):
+        if item.get("date"):
+            daily_raw[item["date"]]["place_receipt"] += 1
+    for item in place_result.get("blog_items", []):
+        if item.get("date"):
+            daily_raw[item["date"]]["place_blog"] += 1
+
+    cumulative = 0
+    daily = []
+    for d in sorted(daily_raw.keys()):
+        row = daily_raw[d]
+        total = sum(row.values())
+        cumulative += total
+        daily.append({
+            "date": d,
+            "blog": row["blog"],
+            "instagram": row["instagram"],
+            "place_receipt": row["place_receipt"],
+            "place_blog": row["place_blog"],
+            "youtube": row["youtube"],
+            "total": total,
+            "cumulative": cumulative,
+        })
+
+    # 요약
     summary = {
-        "naver_blog_count": sum(r["blog_count"] for r in monthly),
-        "instagram_count": sum(r["instagram_count"] for r in monthly),
-        "place_receipt_count": sum(r["place_receipt_count"] for r in monthly),
-        "place_blog_count": sum(r["place_blog_count"] for r in monthly),
-        "youtube_total_views": data["summary"]["youtube_total_views"],
-        "ad_ratio": data["summary"]["ad_ratio"],
-        "self_ratio": data["summary"]["self_ratio"],
+        "naver_blog_count":    blog_total,
+        "instagram_count":     0,
+        "place_receipt_count": place_result.get("receipt_count") or sum(r["place_receipt_count"] for r in monthly),
+        "place_blog_count":    place_result.get("blog_count") or sum(r["place_blog_count"] for r in monthly),
+        "youtube_count":       yt_result["youtube_count"],
+        "youtube_total_views": yt_result["youtube_total_views"],
     }
-
-    youtube_count = sum(r["youtube_count"] for r in monthly)
-    top_videos = [
-        {"title": title, "channel": channel, "views": views}
-        for title, channel, views in data["videos"]
-    ]
-    source_status = {
-        "youtube": {
-            "status": "sample",
-            "reason": "수집 전 샘플 데이터",
-        },
-        "naver_blog": {
-            "status": "sample",
-            "reason": "다음 단계 구현 예정",
-        },
-        "instagram": {
-            "status": "sample",
-            "reason": "다음 단계 구현 예정",
-        },
-    }
-
-    if use_live_youtube:
-        # 실제 수집 모드에서는 샘플 유튜브 월별값을 먼저 전부 0으로 초기화합니다.
-        # 그래야 정확 매칭 영상이 없을 때 월별 유튜브가 2,2,2처럼 남지 않습니다.
-        for row in monthly:
-            row["youtube_count"] = 0
-            row["total_count"] = (
-                row["blog_count"]
-                + row["instagram_count"]
-                + row["place_receipt_count"]
-                + row["place_blog_count"]
-            )
-
-        youtube_count = 0
-        summary["youtube_total_views"] = 0
-        top_videos = []
-
-        youtube_result = collect_youtube_search_scrape(merchant)
-        source_status["youtube"] = {
-            "status": youtube_result["status"],
-            "reason": youtube_result["reason"],
-        }
-
-        if youtube_result["status"] == "ok":
-            summary["youtube_total_views"] = youtube_result["youtube_total_views"] or 0
-            monthly_youtube_counts = youtube_result.get("monthly_youtube_counts", {})
-            undated_count = int(youtube_result.get("undated_count", 0) or 0)
-
-            for row in monthly:
-                matched_count = int(monthly_youtube_counts.get(row["month_key"], 0))
-                row["youtube_count"] = matched_count
-                row["total_count"] = (
-                    row["blog_count"]
-                    + row["instagram_count"]
-                    + row["place_receipt_count"]
-                    + row["place_blog_count"]
-                    + row["youtube_count"]
-                )
-                youtube_count += matched_count
-
-            # YouTube 검색 HTML에서 업로드일을 제공하지 않는 Shorts/영상은
-            # 월별 표에서 누락되지 않도록 선택 기간의 최신 월에 배정합니다.
-            if undated_count > 0 and monthly:
-                monthly[-1]["youtube_count"] += undated_count
-                monthly[-1]["total_count"] += undated_count
-                youtube_count += undated_count
-                source_status["youtube"]["reason"] += f", 날짜 미확인 {undated_count}건은 최신월에 배정"
-
-            if youtube_result["top_videos"]:
-                top_videos = youtube_result["top_videos"]
-
-    if use_live_naver:
-        naver_blog_result = collect_naver_blog_search(merchant)
-        place_review_result = collect_naver_place_review_counts(merchant)
-
-        source_status["naver_blog"] = {
-            "status": naver_blog_result["status"],
-            "reason": naver_blog_result["reason"],
-            "items": naver_blog_result.get("items", []),
-        }
-        source_status["naver_place"] = {
-            "status": place_review_result["status"],
-            "reason": place_review_result["reason"],
-            "place_id": place_review_result.get("place_id"),
-        }
-
-        month_keys = [row["month_key"] for row in monthly]
-
-        if naver_blog_result["status"] == "ok" and naver_blog_result["count"] is not None:
-            blog_total = int(naver_blog_result["count"])
-            summary["naver_blog_count"] = blog_total
-
-            blog_month_map = distribute_items_by_month(naver_blog_result.get("items", []), month_keys)
-            dated_sum = sum(blog_month_map.values())
-            undated = max(0, blog_total - dated_sum)
-
-            for row in monthly:
-                row["blog_count"] = int(blog_month_map.get(row["month_key"], 0))
-
-            # 게시일을 못 잡은 블로그는 최신월에 배정해 총량과 월별 합계가 맞도록 처리
-            if undated and monthly:
-                monthly[-1]["blog_count"] += undated
-                source_status["naver_blog"]["reason"] += f", 날짜 미확인 {undated}건은 최신월 배정"
-
-        if place_review_result["status"] == "ok":
-            if place_review_result.get("place_receipt_count") is not None:
-                receipt_total = int(place_review_result["place_receipt_count"])
-                summary["place_receipt_count"] = receipt_total
-
-                receipt_items_for_month = cap_items_to_total(place_review_result.get("receipt_items", []), receipt_total)
-                receipt_month_map = distribute_items_by_month(receipt_items_for_month, month_keys)
-                dated_sum = sum(receipt_month_map.values())
-
-                if dated_sum >= max(5, int(receipt_total * 0.3)):
-                    # 날짜가 충분하면 실제 날짜 기준만 사용합니다.
-                    # 부족분을 최신월에 몰아넣거나 총량 가중 배분하지 않습니다.
-                    for row in monthly:
-                        row["place_receipt_count"] = int(receipt_month_map.get(row["month_key"], 0))
-                    summary["place_receipt_count"] = int(dated_sum)
-                    source_status["naver_place"]["reason"] += f", 영수증 월별값은 실제 파싱 날짜 {dated_sum}건 기준"
-                else:
-                    # 날짜가 거의 없으면 월별값을 임의 생성하지 않습니다.
-                    for row in monthly:
-                        row["place_receipt_count"] = 0
-                    source_status["naver_place"]["reason"] += f", 영수증 날짜 표본 부족({dated_sum}/{receipt_total})으로 월별 임의 배분 중단"
-
-            if place_review_result.get("place_blog_count") is not None:
-                place_blog_total = int(place_review_result["place_blog_count"])
-                summary["place_blog_count"] = place_blog_total
-
-                place_blog_items_for_month = cap_items_to_total(place_review_result.get("place_blog_items", []), place_blog_total)
-                place_blog_month_map = distribute_items_by_month(place_blog_items_for_month, month_keys)
-                dated_sum = sum(place_blog_month_map.values())
-
-                if dated_sum >= max(3, int(place_blog_total * 0.3)):
-                    for row in monthly:
-                        row["place_blog_count"] = int(place_blog_month_map.get(row["month_key"], 0))
-                    undated = max(0, place_blog_total - dated_sum)
-                    if undated and monthly:
-                        monthly[-1]["place_blog_count"] += undated
-                        source_status["naver_place"]["reason"] += f", 플레이스 블로그 날짜 미확인 {undated}건은 최신월 배정"
-                else:
-                    place_blog_monthly = distribute_total_to_recent_months(place_blog_total, len(monthly))
-                    for i, row in enumerate(monthly):
-                        row["place_blog_count"] = place_blog_monthly[i]
-                    source_status["naver_place"]["reason"] += f", 플레이스 블로그 날짜 표본 부족({dated_sum}/{place_blog_total})으로 총량 가중 배분"
-
-        for row in monthly:
-            row["total_count"] = (
-                row["blog_count"]
-                + row["instagram_count"]
-                + row["place_receipt_count"]
-                + row["place_blog_count"]
-                + row["youtube_count"]
-            )
-
     summary["total_mentions"] = (
-        summary["naver_blog_count"]
-        + summary["instagram_count"]
-        + summary["place_receipt_count"]
-        + summary["place_blog_count"]
-        + youtube_count
+        summary["naver_blog_count"] + summary["instagram_count"] +
+        summary["place_receipt_count"] + summary["place_blog_count"] +
+        summary["youtube_count"]
     )
 
-    # 최종 안전 보정: 월별 상세 합계가 요약 총량보다 커지는 경우 방지
-    receipt_fix_reason = force_monthly_channel_total(
-        monthly,
-        "place_receipt_count",
-        summary.get("place_receipt_count"),
-        "영수증 리뷰",
-    )
-    if receipt_fix_reason:
-        source_status["naver_place"]["reason"] += ", " + receipt_fix_reason
+    # 채널 비중
+    channel_share = [
+        {"name": "네이버 블로그", "value": summary["naver_blog_count"]},
+        {"name": "인스타그램",    "value": summary["instagram_count"]},
+        {"name": "영수증 리뷰",   "value": summary["place_receipt_count"]},
+        {"name": "플레이스 블로그 리뷰", "value": summary["place_blog_count"]},
+        {"name": "유튜브",        "value": summary["youtube_count"]},
+    ]
 
-    place_blog_fix_reason = force_monthly_channel_total(
-        monthly,
-        "place_blog_count",
-        summary.get("place_blog_count"),
-        "플레이스 블로그 리뷰",
-    )
-    if place_blog_fix_reason:
-        source_status["naver_place"]["reason"] += ", " + place_blog_fix_reason
+    # ChatGPT용 JSON payload
+    chatgpt_payload = {
+        "merchant_id":   merchant["id"],
+        "merchant_name": merchant["name"],
+        "period":        period,
+        "platform_summary": summary,
+        "monthly_stats": monthly,
+        "daily_stats":   daily,
+        "top_videos":    yt_result.get("top_videos", []),
+        "auto_prompt":   (
+            f"'{merchant['name']}' {period} 멀티플랫폼 데이터입니다. "
+            "①플랫폼별 노출 추이 ②방문자 리뷰 키워드 감성 분석 ③월별 성장률 ④개선 제안 3가지 ⑤다음달 예측을 포함한 월간 리포트를 작성해주세요."
+        ),
+    }
 
-    # 전체 컬럼도 보정된 월별값 기준으로 재계산
-    for row in monthly:
-        row["total_count"] = (
-            int(row.get("blog_count", 0) or 0)
-            + int(row.get("instagram_count", 0) or 0)
-            + int(row.get("place_receipt_count", 0) or 0)
-            + int(row.get("place_blog_count", 0) or 0)
-            + int(row.get("youtube_count", 0) or 0)
+    report = {
+        "merchant_id":     merchant["id"],
+        "merchant_name":   merchant["name"],
+        "region":          merchant.get("region", ""),
+        "generated_at":    now_text(),
+        "period":          period,
+        "period_label":    period,
+        "summary":         summary,
+        "monthly_summary": monthly,
+        "daily_summary":   daily,
+        "channel_share":   channel_share,
+        "top_videos":      yt_result.get("top_videos", []),
+        "chatgpt_payload": chatgpt_payload,
+        # 엑셀 원시 데이터용
+        "_raw_blog_items":       blog_result.get("items", []),
+        "_raw_place_items":      place_result.get("receipt_items", []),
+        "_raw_place_blog_items": place_result.get("blog_items", []),
+        "source_status": {
+            "naver_blog":   {"status": blog_result["status"], "count": blog_result["count"]},
+            "naver_place":  {"status": place_result["status"], "place_id": place_id},
+            "youtube":      {"status": yt_result["status"], "count": yt_result["youtube_count"]},
+            "instagram":    {"status": "pending", "note": "다음 버전 구현"},
+        },
+    }
+    return report
+
+
+# ══════════════════════════════════════════
+# Claude API 자체분석 리포트
+# ══════════════════════════════════════════
+def generate_claude_report(report: dict) -> dict:
+    if not ANTHROPIC_API_KEY:
+        return {"status": "error", "reason": "ANTHROPIC_API_KEY 미설정", "html": "", "analysis": {}}
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        merchant_name = report["merchant_name"]
+        period = report["period"]
+        summary = report["summary"]
+        monthly = report["monthly_summary"]
+
+        prompt = f"""당신은 외식업 마케팅 전문 분석가입니다.
+아래 데이터를 기반으로 '{merchant_name}'의 {period} 온라인 마케팅 분석 리포트를 작성해주세요.
+
+## 데이터
+- 네이버 블로그 게시 수: {summary.get('naver_blog_count', 0)}건
+- 인스타그램 게시 수: {summary.get('instagram_count', 0)}건
+- 플레이스 영수증 리뷰: {summary.get('place_receipt_count', 0)}건
+- 플레이스 블로그 리뷰: {summary.get('place_blog_count', 0)}건
+- 유튜브 영상 수: {summary.get('youtube_count', 0)}건 (총 조회수: {summary.get('youtube_total_views', 0):,})
+- 총 언급 수: {summary.get('total_mentions', 0)}건
+
+## 월별 추이
+{json.dumps(monthly, ensure_ascii=False, indent=2)}
+
+## 작성 요구사항
+다음 6개 섹션으로 구성하여 **한국어**로 작성하세요. JSON 형식으로만 응답하세요.
+
+{{
+  "overall_score": 75,
+  "overall_comment": "전반적인 한줄 평가 (50자 이내)",
+  "sections": [
+    {{
+      "title": "플랫폼별 노출 현황",
+      "content": "상세 분석 내용 (200자 이상)",
+      "highlight": "핵심 인사이트 1문장"
+    }},
+    {{
+      "title": "월별 성장 트렌드",
+      "content": "월별 증감 분석",
+      "highlight": "핵심 인사이트"
+    }},
+    {{
+      "title": "방문자 리뷰 분석",
+      "content": "영수증/블로그 리뷰 품질 분석",
+      "highlight": "핵심 인사이트"
+    }},
+    {{
+      "title": "채널별 효과 분석",
+      "content": "각 채널의 기여도와 효율성",
+      "highlight": "핵심 인사이트"
+    }},
+    {{
+      "title": "개선 제안 사항",
+      "content": "구체적인 액션 아이템 3가지",
+      "highlight": "최우선 실행 과제"
+    }},
+    {{
+      "title": "다음 달 예측 및 목표",
+      "content": "예측 근거와 달성 목표",
+      "highlight": "목표 수치"
+    }}
+  ],
+  "action_items": ["즉시 실행 과제 1", "즉시 실행 과제 2", "즉시 실행 과제 3"],
+  "risk_flags": ["주의 사항 1", "주의 사항 2"]
+}}"""
+
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=3000,
+            messages=[{"role": "user", "content": prompt}]
         )
 
-    return {
-        "merchant_name": merchant["name"],
-        "region": merchant.get("region", ""),
-        "generated_at": now_text(),
-        "period": period,
-        "start_date": start_date,
-        "end_date": end_date,
-        "period_label": get_period_label(period, start_date, end_date),
-        "source_status": source_status,
-        "summary": summary,
-        "monthly_summary": monthly,
-        "channel_share": [
-            {"name": "네이버 블로그", "value": summary["naver_blog_count"]},
-            {"name": "인스타그램", "value": summary["instagram_count"]},
-            {"name": "영수증 리뷰", "value": summary["place_receipt_count"]},
-            {"name": "플레이스 블로그 리뷰", "value": summary["place_blog_count"]},
-            {"name": "유튜브", "value": youtube_count},
-        ],
-        "top_videos": top_videos,
-        "insights": [
-            f"{merchant['name']}의 온라인 언급량은 채널별로 차이가 있습니다.",
-            "네이버 블로그와 인스타그램은 주요 노출 채널로 확인됩니다.",
-            "네이버 플레이스 리뷰는 실제 방문 반응을 확인하는 핵심 지표입니다.",
-            "유튜브 콘텐츠는 조회수 기반 인지도 확산 여부를 함께 봐야 합니다.",
-        ],
-    }
+        raw = message.content[0].text.strip()
+        raw = re.sub(r"```json\s*", "", raw)
+        raw = re.sub(r"```\s*", "", raw)
+        analysis = json.loads(raw)
+
+        # HTML 리포트 렌더링
+        html = _render_claude_report_html(merchant_name, period, summary, analysis, report)
+
+        return {"status": "ok", "html": html, "analysis": analysis}
+
+    except Exception as e:
+        logger.error(f"[Claude] 분석 실패: {e}")
+        return {"status": "error", "reason": str(e)[:300], "html": "", "analysis": {}}
 
 
+def _render_claude_report_html(merchant_name: str, period: str, summary: dict, analysis: dict, report: dict) -> str:
+    score = analysis.get("overall_score", 0)
+    score_color = "#00d4ff" if score >= 70 else "#ffd166" if score >= 50 else "#f87171"
+    sections = analysis.get("sections", [])
+    action_items = analysis.get("action_items", [])
+    risk_flags = analysis.get("risk_flags", [])
+    overall_comment = analysis.get("overall_comment", "")
+
+    monthly = report.get("monthly_summary", [])
+    max_total = max((r["total_count"] for r in monthly), default=1) or 1
+
+    monthly_bars = ""
+    for row in monthly:
+        pct = int(row["total_count"] / max_total * 100)
+        monthly_bars += f"""
+        <div class="bar-row">
+          <div class="bar-label">{row['month']}</div>
+          <div class="bar-wrap"><div class="bar-fill" style="width:{pct}%"></div></div>
+          <div class="bar-val">{row['total_count']}건</div>
+        </div>"""
+
+    sections_html = ""
+    for i, sec in enumerate(sections):
+        color = ["#00d4ff", "#00e5a0", "#ffd166", "#ff6b35", "#7c3aed", "#f472b6"][i % 6]
+        sections_html += f"""
+        <div class="section-card" style="border-left: 3px solid {color}">
+          <div class="section-title" style="color:{color}">{sec.get('title', '')}</div>
+          <div class="section-content">{sec.get('content', '')}</div>
+          <div class="highlight-box">💡 {sec.get('highlight', '')}</div>
+        </div>"""
+
+    action_html = "".join(f'<div class="action-item">✅ {a}</div>' for a in action_items)
+    risk_html   = "".join(f'<div class="risk-item">⚠️ {r}</div>' for r in risk_flags)
+
+    channel_rows = ""
+    for ch in report.get("channel_share", []):
+        channel_rows += f"<tr><td>{ch['name']}</td><td class='num'>{ch['value']:,}건</td></tr>"
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{merchant_name} 분석 리포트 - AI매출업</title>
+<style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ font-family:'Noto Sans KR',sans-serif; background:#0a0c10; color:#e8eaf0; font-size:14px; line-height:1.7; }}
+  .page {{ max-width:900px; margin:0 auto; padding:40px 24px; }}
+  .header {{ text-align:center; padding:48px 0 36px; border-bottom:1px solid #1e2330; margin-bottom:40px; }}
+  .brand {{ font-size:11px; letter-spacing:3px; color:#00d4ff; margin-bottom:12px; }}
+  .merchant-name {{ font-size:32px; font-weight:900; letter-spacing:-1px; margin-bottom:8px; }}
+  .period-badge {{ display:inline-block; background:#1e2330; border:1px solid #00d4ff; color:#00d4ff; padding:4px 16px; border-radius:20px; font-size:12px; }}
+  .generated {{ font-size:11px; color:#5a6278; margin-top:12px; }}
+  .score-block {{ display:flex; align-items:center; justify-content:center; gap:32px; margin:40px 0; }}
+  .score-circle {{ width:120px; height:120px; border-radius:50%; border:4px solid {score_color}; display:flex; flex-direction:column; align-items:center; justify-content:center; }}
+  .score-num {{ font-size:42px; font-weight:900; color:{score_color}; line-height:1; }}
+  .score-label {{ font-size:10px; color:#5a6278; letter-spacing:1px; }}
+  .score-comment {{ max-width:400px; font-size:15px; color:#c9d1e0; line-height:1.6; }}
+  .kpi-grid {{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:32px 0; }}
+  .kpi-card {{ background:#111318; border:1px solid #1e2330; border-radius:8px; padding:20px; text-align:center; }}
+  .kpi-label {{ font-size:11px; color:#5a6278; margin-bottom:8px; }}
+  .kpi-val {{ font-size:28px; font-weight:700; color:#00d4ff; }}
+  .kpi-unit {{ font-size:12px; color:#5a6278; }}
+  .section-title-main {{ font-size:13px; letter-spacing:2px; color:#5a6278; margin:40px 0 16px; padding-bottom:8px; border-bottom:1px solid #1e2330; }}
+  .section-card {{ background:#111318; border:1px solid #1e2330; border-left:3px solid #00d4ff; border-radius:8px; padding:20px; margin-bottom:12px; }}
+  .section-title {{ font-size:14px; font-weight:700; margin-bottom:10px; }}
+  .section-content {{ font-size:13px; color:#9ba3b4; line-height:1.8; margin-bottom:12px; }}
+  .highlight-box {{ background:#0a0c10; border:1px solid #1e2330; border-radius:6px; padding:10px 14px; font-size:12px; color:#ffd166; }}
+  .bar-row {{ display:flex; align-items:center; gap:12px; margin-bottom:8px; }}
+  .bar-label {{ width:100px; font-size:12px; color:#5a6278; text-align:right; flex-shrink:0; }}
+  .bar-wrap {{ flex:1; background:#1e2330; border-radius:4px; height:18px; overflow:hidden; }}
+  .bar-fill {{ height:100%; background:linear-gradient(90deg,#00d4ff,#7c3aed); border-radius:4px; transition:width 0.5s; }}
+  .bar-val {{ width:60px; font-size:12px; color:#00d4ff; text-align:right; }}
+  .channel-table {{ width:100%; border-collapse:collapse; background:#111318; border-radius:8px; overflow:hidden; border:1px solid #1e2330; }}
+  .channel-table th {{ background:#181c24; color:#5a6278; font-size:10px; letter-spacing:1px; padding:10px 16px; text-align:left; }}
+  .channel-table td {{ padding:10px 16px; border-bottom:1px solid #1e2330; font-size:13px; }}
+  .channel-table td.num {{ color:#00d4ff; font-weight:700; text-align:right; }}
+  .channel-table tr:last-child td {{ border-bottom:none; }}
+  .action-item {{ background:#111318; border:1px solid #00e5a0; border-radius:6px; padding:10px 16px; margin-bottom:8px; font-size:13px; color:#00e5a0; }}
+  .risk-item {{ background:#111318; border:1px solid #ffd166; border-radius:6px; padding:10px 16px; margin-bottom:8px; font-size:13px; color:#ffd166; }}
+  .footer {{ text-align:center; padding:40px 0 24px; border-top:1px solid #1e2330; margin-top:48px; }}
+  .footer-brand {{ font-size:13px; color:#5a6278; }}
+  @media print {{
+    body {{ background:#fff; color:#111; }}
+    .kpi-card, .section-card {{ background:#f8f9fa; border-color:#ddd; }}
+    .bar-wrap {{ background:#eee; }}
+  }}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="header">
+    <div class="brand">AI매출업 · 가맹점 분석 리포트</div>
+    <div class="merchant-name">{merchant_name}</div>
+    <div class="period-badge">{period}</div>
+    <div class="generated">생성일: {now_text()}</div>
+  </div>
+
+  <div class="score-block">
+    <div class="score-circle">
+      <div class="score-num">{score}</div>
+      <div class="score-label">종합 점수</div>
+    </div>
+    <div class="score-comment">{overall_comment}</div>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi-card">
+      <div class="kpi-label">총 언급 수</div>
+      <div class="kpi-val">{summary.get('total_mentions', 0):,}</div>
+      <div class="kpi-unit">건</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">영수증 리뷰</div>
+      <div class="kpi-val">{summary.get('place_receipt_count', 0):,}</div>
+      <div class="kpi-unit">건</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">유튜브 조회수</div>
+      <div class="kpi-val">{summary.get('youtube_total_views', 0):,}</div>
+      <div class="kpi-unit">회</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">네이버 블로그</div>
+      <div class="kpi-val">{summary.get('naver_blog_count', 0):,}</div>
+      <div class="kpi-unit">건</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">인스타그램</div>
+      <div class="kpi-val">{summary.get('instagram_count', 0):,}</div>
+      <div class="kpi-unit">건</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">플레이스 블로그</div>
+      <div class="kpi-val">{summary.get('place_blog_count', 0):,}</div>
+      <div class="kpi-unit">건</div>
+    </div>
+  </div>
+
+  <div class="section-title-main">월별 추이</div>
+  {monthly_bars}
+
+  <div class="section-title-main">채널별 현황</div>
+  <table class="channel-table">
+    <thead><tr><th>채널</th><th style="text-align:right">건수</th></tr></thead>
+    <tbody>{channel_rows}</tbody>
+  </table>
+
+  <div class="section-title-main">AI 분석 리포트</div>
+  {sections_html}
+
+  <div class="section-title-main">즉시 실행 과제</div>
+  {action_html}
+
+  <div class="section-title-main">주의 사항</div>
+  {risk_html}
+
+  <div class="footer">
+    <div class="footer-brand">먼키 · AI매출업 · 가맹점 마케팅 분석 리포트</div>
+  </div>
+</div>
+</body>
+</html>"""
+
+
+# ══════════════════════════════════════════
+# PDF 변환 (Playwright)
+# ══════════════════════════════════════════
+def html_to_pdf(html_content: str, output_path: str) -> bool:
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.set_content(html_content, wait_until="networkidle", timeout=30000)
+            page.pdf(
+                path=output_path,
+                format="A4",
+                print_background=True,
+                margin={"top": "20mm", "bottom": "20mm", "left": "15mm", "right": "15mm"},
+            )
+            browser.close()
+        return True
+    except Exception as e:
+        logger.error(f"[PDF] 변환 실패: {e}")
+        return False
+
+
+# ══════════════════════════════════════════
+# 수집 Job 실행 (백그라운드)
+# ══════════════════════════════════════════
+def run_crawl_job(job_id: str, merchant: dict, period: str):
+    started = time.time()
+    try:
+        CRAWL_JOBS[job_id]["status"] = "running"
+        CRAWL_JOBS[job_id]["message"] = "데이터 수집 중..."
+
+        def work():
+            return build_report(merchant, period=period)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(work)
+            report = future.result(timeout=CRAWL_TIMEOUT)
+
+        REPORTS[merchant["id"]] = report
+        elapsed = int(time.time() - started)
+
+        # Claude 분석
+        CRAWL_JOBS[job_id]["message"] = "AI 분석 리포트 생성 중..."
+        claude_result = generate_claude_report(report)
+        REPORTS[merchant["id"]]["claude_report"] = claude_result
+
+        # PDF 저장
+        if claude_result["status"] == "ok" and claude_result["html"]:
+            pdf_path = str(OUT_DIR / f"{merchant['id']}_{job_id[:8]}.pdf")
+            if html_to_pdf(claude_result["html"], pdf_path):
+                REPORTS[merchant["id"]]["pdf_path"] = pdf_path
+                REPORTS[merchant["id"]]["pdf_job_id"] = job_id[:8]
+
+        CRAWL_JOBS[job_id].update({
+            "status": "success",
+            "message": f"수집 완료 ({elapsed}초)",
+            "finished_at": now_iso(),
+            "elapsed_seconds": elapsed,
+        })
+
+    except concurrent.futures.TimeoutError:
+        CRAWL_JOBS[job_id].update({
+            "status": "timeout",
+            "message": f"시간 초과 ({CRAWL_TIMEOUT}초)",
+            "finished_at": now_iso(),
+            "elapsed_seconds": int(time.time() - started),
+        })
+    except Exception as e:
+        CRAWL_JOBS[job_id].update({
+            "status": "error",
+            "message": f"오류: {str(e)[:200]}",
+            "finished_at": now_iso(),
+            "elapsed_seconds": int(time.time() - started),
+        })
+
+
+# ══════════════════════════════════════════
+# API 엔드포인트
+# ══════════════════════════════════════════
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "1.9.0"}
-
+    return {"status": "ok", "service": "AI매출업 리포트 API", "version": "2.0.0"}
 
 @app.get("/api/health")
 def health():
     return {"status": "ok", "time": now_text()}
 
-
-@app.get("/api/debug-login-config")
-def debug_login_config():
-    return {
-        "admin_email": ADMIN_EMAIL,
-        "admin_password_length": len(ADMIN_PASSWORD),
-        "admin_password_preview": ADMIN_PASSWORD[:1] + "***" + ADMIN_PASSWORD[-1:] if ADMIN_PASSWORD else "",
-        "jwt_secret_set": bool(JWT_SECRET_KEY),
-    }
-
-
-@app.get("/api/debug-source-config")
-def debug_source_config():
-    return {
-        "youtube_collection_mode": "html_scrape_strict_with_published_month_v5_allocate_undated",
-        "naver_blog_collection_mode": "html_scrape_with_post_date",
-        "naver_place_review_collection_mode": "playwright_expand_button_full_scroll_v8",
-        "youtube_api_key_required": False,
-    }
-
-
 @app.post("/api/auth/login")
 def login(payload: LoginRequest):
-    input_email = payload.email.strip()
-    input_password = payload.password.strip()
-
-    if input_email != ADMIN_EMAIL or input_password != ADMIN_PASSWORD:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="이메일 또는 비밀번호가 올바르지 않습니다.",
-        )
-
+    if payload.email.strip() != ADMIN_EMAIL or payload.password.strip() != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 올바르지 않습니다.")
     return {
-        "access_token": create_token(input_email),
+        "access_token": create_token(payload.email),
         "token_type": "bearer",
         "expires_in_minutes": JWT_EXPIRE_MINUTES,
-        "admin_email": input_email,
     }
-
 
 @app.get("/api/merchants")
 def list_merchants(admin: str = Depends(verify_token)):
     return MERCHANTS
 
-
 @app.get("/api/reports/{merchant_id}")
-def get_report(
-    merchant_id: str,
-    period: str = "최근 6개월",
-    start_date: str | None = None,
-    end_date: str | None = None,
-    admin: str = Depends(verify_token)
-):
+def get_report(merchant_id: str, period: str = "최근 6개월", admin: str = Depends(verify_token)):
     merchant = next((m for m in MERCHANTS if m["id"] == merchant_id), None)
-
     if not merchant:
         raise HTTPException(status_code=404, detail="가맹점을 찾을 수 없습니다.")
-
     report = REPORTS.get(merchant_id)
     if not report:
-        report = make_sample_report(
-            merchant,
-            period=period,
-            start_date=start_date,
-            end_date=end_date,
-            use_live_youtube=False,
-        )
+        # 샘플 데이터 반환 (수집 전)
+        report = _sample_report(merchant, period)
         REPORTS[merchant_id] = report
-
-    report["period"] = period
-    report["start_date"] = start_date
-    report["end_date"] = end_date
-    report["period_label"] = get_period_label(period, start_date, end_date)
-
     return report
 
-
 @app.post("/api/crawl-jobs")
-def create_crawl_job(payload: CrawlJobCreate, email: str = Depends(verify_token)):
-    """
-    동기식 수집 실행 + timeout + 검증.
-    프론트는 이 응답을 받을 때 완료/실패 여부를 즉시 알 수 있습니다.
-    """
-    job_id = str(uuid4())
-    merchant_id = payload.merchant_id
-    period = getattr(payload, "period", "최근 6개월") or "최근 6개월"
-
-    merchant = next((m for m in MERCHANTS if m["id"] == merchant_id), None)
+def create_crawl_job(payload: CrawlJobCreate, background_tasks: BackgroundTasks, email: str = Depends(verify_token)):
+    merchant = next((m for m in MERCHANTS if m["id"] == payload.merchant_id), None)
     if not merchant:
         raise HTTPException(status_code=404, detail="가맹점을 찾을 수 없습니다.")
 
+    job_id = str(uuid4())
     CRAWL_JOBS[job_id] = {
         "job_id": job_id,
-        "merchant_id": merchant_id,
-        "merchant_name": merchant.get("name"),
-        "period": period,
-        "status": "running",
-        "message": "수집 작업을 시작했습니다.",
+        "merchant_id": payload.merchant_id,
+        "merchant_name": merchant["name"],
+        "period": payload.period,
+        "status": "queued",
+        "message": "수집 대기 중...",
         "started_at": now_iso(),
-        "updated_at": now_iso(),
         "finished_at": None,
         "elapsed_seconds": 0,
-        "validation_errors": [],
     }
 
-    started = time.time()
-
-    try:
-        def work():
-            # 기존 make_sample_report를 실제 수집 함수로 사용
-            result = make_sample_report(merchant, period=period) if "period" in make_sample_report.__code__.co_varnames else make_sample_report(merchant)
-            REPORTS[merchant_id] = result
-            return result
-
-        report = run_with_timeout(work, CRAWL_TIMEOUT_SECONDS)
-        elapsed = int(time.time() - started)
-
-        is_valid, validation_errors = validate_report_result(report)
-
-        if not is_valid:
-            set_job_status(
-                job_id,
-                status="warning",
-                message="수집은 완료되었지만 검증 경고가 있습니다.",
-                finished_at=now_iso(),
-                elapsed_seconds=elapsed,
-                validation_errors=validation_errors,
-                report_generated_at=report.get("generated_at") if report else None,
-            )
-        else:
-            set_job_status(
-                job_id,
-                status="success",
-                message="수집이 완료되었습니다.",
-                finished_at=now_iso(),
-                elapsed_seconds=elapsed,
-                validation_errors=[],
-                report_generated_at=report.get("generated_at") if report else None,
-            )
-
-        return CRAWL_JOBS[job_id]
-
-    except concurrent.futures.TimeoutError:
-        elapsed = int(time.time() - started)
-        set_job_status(
-            job_id,
-            status="timeout",
-            message=f"수집 제한 시간({CRAWL_TIMEOUT_SECONDS}초)을 초과했습니다. 네이버/유튜브 응답 지연 또는 무한 스크롤 종료 실패 가능성이 있습니다.",
-            finished_at=now_iso(),
-            elapsed_seconds=elapsed,
-            validation_errors=["timeout"],
-        )
-        return CRAWL_JOBS[job_id]
-
-    except Exception as e:
-        elapsed = int(time.time() - started)
-        set_job_status(
-            job_id,
-            status="error",
-            message=f"수집 실패: {str(e)[:300]}",
-            finished_at=now_iso(),
-            elapsed_seconds=elapsed,
-            validation_errors=[str(e)[:300]],
-        )
-        return CRAWL_JOBS[job_id]
-
+    background_tasks.add_task(run_crawl_job, job_id, merchant, payload.period)
+    return CRAWL_JOBS[job_id]
 
 @app.get("/api/crawl-jobs/{job_id}")
 def get_crawl_job(job_id: str, email: str = Depends(verify_token)):
     job = CRAWL_JOBS.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="수집 작업을 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
     return job
 
-
 @app.get("/api/reports/{merchant_id}/pdf")
-def get_pdf(merchant_id: str, period: str = "최근 6개월"):
-    return {"message": "PDF 기능은 다음 단계에서 연결됩니다.", "merchant_id": merchant_id, "period": period}
+def download_pdf(merchant_id: str, admin: str = Depends(verify_token)):
+    report = REPORTS.get(merchant_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="리포트가 없습니다. 먼저 수집을 실행해주세요.")
+    pdf_path = report.get("pdf_path")
+    if not pdf_path or not Path(pdf_path).exists():
+        raise HTTPException(status_code=404, detail="PDF 파일이 없습니다. 수집 완료 후 다시 시도하세요.")
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+    merchant_name = report.get("merchant_name", merchant_id)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={merchant_name}_report.pdf"}
+    )
+
+@app.get("/api/reports/{merchant_id}/chatgpt-json")
+def download_chatgpt_json(merchant_id: str, admin: str = Depends(verify_token)):
+    report = REPORTS.get(merchant_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="리포트가 없습니다.")
+    payload = report.get("chatgpt_payload", {})
+    merchant_name = report.get("merchant_name", merchant_id)
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename={merchant_name}_chatgpt.json"}
+    )
+
+@app.get("/api/reports/{merchant_id}/claude-report")
+def get_claude_report(merchant_id: str, admin: str = Depends(verify_token)):
+    report = REPORTS.get(merchant_id)
+    if not report or not report.get("claude_report"):
+        raise HTTPException(status_code=404, detail="Claude 분석 리포트가 없습니다.")
+    cr = report["claude_report"]
+    return Response(content=cr.get("html", ""), media_type="text/html; charset=utf-8")
+
+
+# ══════════════════════════════════════════
+# 샘플 데이터 (수집 전 초기 화면용)
+# ══════════════════════════════════════════
+def _sample_report(merchant: dict, period: str) -> dict:
+    month_count = get_month_count(period)
+    month_keys = build_month_keys(month_count)
+    monthly = []
+    for i, mk in enumerate(month_keys):
+        base = 10 + i * 2
+        monthly.append({
+            "month": month_key_label(mk), "month_key": mk,
+            "blog_count": base, "instagram_count": base*2,
+            "place_receipt_count": base//2, "place_blog_count": base//3,
+            "youtube_count": 1, "total_count": base*4,
+        })
+    summary = {
+        "total_mentions": sum(r["total_count"] for r in monthly),
+        "naver_blog_count": sum(r["blog_count"] for r in monthly),
+        "instagram_count": sum(r["instagram_count"] for r in monthly),
+        "place_receipt_count": sum(r["place_receipt_count"] for r in monthly),
+        "place_blog_count": sum(r["place_blog_count"] for r in monthly),
+        "youtube_count": len(monthly),
+        "youtube_total_views": 50000,
+    }
+    return {
+        "merchant_id": merchant["id"],
+        "merchant_name": merchant["name"],
+        "region": merchant.get("region", ""),
+        "generated_at": now_text(),
+        "period": period, "period_label": period,
+        "is_sample": True,
+        "summary": summary,
+        "monthly_summary": monthly,
+        "daily_summary": [],
+        "channel_share": [
+            {"name": "네이버 블로그", "value": summary["naver_blog_count"]},
+            {"name": "인스타그램", "value": summary["instagram_count"]},
+            {"name": "영수증 리뷰", "value": summary["place_receipt_count"]},
+            {"name": "플레이스 블로그 리뷰", "value": summary["place_blog_count"]},
+            {"name": "유튜브", "value": summary["youtube_count"]},
+        ],
+        "top_videos": [],
+        "source_status": {"note": "수집 전 샘플 데이터입니다. [수집 시작] 버튼을 눌러주세요."},
+    }
+
+
+# ══════════════════════════════════════════
+# 가맹점 CRUD API
+# ══════════════════════════════════════════
+class MerchantCreate(BaseModel):
+    name: str
+    region: str = ""
+    address: str = ""
+    naver_place_url: str = ""
+    blog_keywords: list[str] = []
+    instagram_hashtags: list[str] = []
+    instagram_channel: str = ""
+    youtube_keywords: list[str] = []
+
+class MerchantUpdate(MerchantCreate):
+    pass
+
+
+@app.post("/api/merchants")
+def add_merchant(payload: MerchantCreate, admin: str = Depends(verify_token)):
+    """가맹점 추가"""
+    new_id = re.sub(r"[^a-z0-9_]", "_", payload.name.lower().strip())
+    new_id = f"{new_id}_{len(MERCHANTS)+1}"
+
+    if any(m["id"] == new_id or m["name"] == payload.name for m in MERCHANTS):
+        raise HTTPException(status_code=409, detail="이미 등록된 가맹점명입니다.")
+
+    merchant = {
+        "id": new_id,
+        **payload.model_dump(),
+    }
+    MERCHANTS.append(merchant)
+    return merchant
+
+
+@app.put("/api/merchants/{merchant_id}")
+def update_merchant(merchant_id: str, payload: MerchantUpdate, admin: str = Depends(verify_token)):
+    """가맹점 정보 수정"""
+    for i, m in enumerate(MERCHANTS):
+        if m["id"] == merchant_id:
+            MERCHANTS[i] = {"id": merchant_id, **payload.model_dump()}
+            # 기존 리포트 캐시 삭제 (재수집 필요)
+            REPORTS.pop(merchant_id, None)
+            return MERCHANTS[i]
+    raise HTTPException(status_code=404, detail="가맹점을 찾을 수 없습니다.")
+
+
+@app.delete("/api/merchants/{merchant_id}")
+def delete_merchant(merchant_id: str, admin: str = Depends(verify_token)):
+    """가맹점 삭제"""
+    global MERCHANTS
+    original = len(MERCHANTS)
+    MERCHANTS = [m for m in MERCHANTS if m["id"] != merchant_id]
+    if len(MERCHANTS) == original:
+        raise HTTPException(status_code=404, detail="가맹점을 찾을 수 없습니다.")
+    REPORTS.pop(merchant_id, None)
+    return {"deleted": merchant_id}
+
+
+# ══════════════════════════════════════════
+# 엑셀 다운로드 3종
+# ══════════════════════════════════════════
+def _get_report_or_404(merchant_id: str) -> dict:
+    report = REPORTS.get(merchant_id)
+    if not report or report.get("is_sample"):
+        raise HTTPException(
+            status_code=404,
+            detail="수집된 데이터가 없습니다. 먼저 [수집 시작]을 실행해주세요."
+        )
+    return report
+
+
+@app.get("/api/reports/{merchant_id}/excel/raw")
+def download_excel_raw(merchant_id: str, admin: str = Depends(verify_token)):
+    """① 원시 데이터 엑셀"""
+    if not EXCEL_AVAILABLE:
+        raise HTTPException(status_code=500, detail="엑셀 라이브러리가 설치되지 않았습니다.")
+    report = _get_report_or_404(merchant_id)
+    xlsx_bytes = make_raw_excel(report)
+    name = report.get("merchant_name", merchant_id)
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={name}_원시데이터.xlsx"},
+    )
+
+
+@app.get("/api/reports/{merchant_id}/excel/daily")
+def download_excel_daily(merchant_id: str, admin: str = Depends(verify_token)):
+    """② 일별 집계 엑셀"""
+    if not EXCEL_AVAILABLE:
+        raise HTTPException(status_code=500, detail="엑셀 라이브러리가 설치되지 않았습니다.")
+    report = _get_report_or_404(merchant_id)
+    xlsx_bytes = make_daily_excel(report)
+    name = report.get("merchant_name", merchant_id)
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={name}_일별집계.xlsx"},
+    )
+
+
+@app.get("/api/reports/{merchant_id}/excel/monthly")
+def download_excel_monthly(merchant_id: str, admin: str = Depends(verify_token)):
+    """③ 월별 집계 엑셀"""
+    if not EXCEL_AVAILABLE:
+        raise HTTPException(status_code=500, detail="엑셀 라이브러리가 설치되지 않았습니다.")
+    report = _get_report_or_404(merchant_id)
+    xlsx_bytes = make_monthly_excel(report)
+    name = report.get("merchant_name", merchant_id)
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={name}_월별집계.xlsx"},
+    )
