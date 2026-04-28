@@ -4,11 +4,6 @@ import concurrent.futures
 import time
 import re
 import uuid
-from datetime import datetime, timezone
-from typing import Any
-from uuid import uuid4
-
-from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 
 # 모든 출처를 허용하도록 설정을 확장합니다.
@@ -19,6 +14,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+from datetime import datetime, timezone
+from typing import Any
+from uuid import uuid4
+
+from fastapi import Depends, FastAPI, HTTPException, status
+
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
