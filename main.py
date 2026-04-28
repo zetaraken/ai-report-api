@@ -2,7 +2,6 @@ import json
 import os
 import concurrent.futures
 import time
-import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -10,29 +9,14 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-
-# 이 줄이 반드시 있어야 합니다
-app = FastAPI() 
-
-# CORS 설정 (Vercel과의 통신을 위해 필수)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 
-# ==========================================
-# 1. FastAPI 앱 선언 (가장 먼저 실행되어야 함)
-# ==========================================
+# 1. FastAPI 앱 선언
 app = FastAPI(title="AI매출업 리포트 API", version="2.0.0")
 
-# ==========================================
-# 2. CORS 설정 (모든 출처 허용)
-# ==========================================
+# 2. CORS 설정 (Vercel 통신 허용)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,13 +27,10 @@ app.add_middleware(
 
 security = HTTPBearer()
 
-# ==========================================
 # 3. 설정 및 환경변수
-# ==========================================
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "zetarise@gmail.com").strip()
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "4858").strip()
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "ai-report-secret-2026").strip()
-# Railway에서 설정한 DATABASE_URL을 가져옵니다.
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 JWT_ALGORITHM = "HS256"
@@ -59,9 +40,7 @@ JWT_EXPIRE_MINUTES = 720
 CRAWL_JOBS = {}
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
-# ==========================================
 # 4. 데이터 모델
-# ==========================================
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
@@ -69,9 +48,7 @@ class LoginRequest(BaseModel):
 class CrawlJobCreate(BaseModel):
     merchant_id: str
 
-# ==========================================
 # 5. 유틸리티 함수 및 인증
-# ==========================================
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -82,10 +59,7 @@ def verify_token(auth: HTTPAuthorizationCredentials = Depends(security)):
     except JWTError:
         raise HTTPException(status_code=401, detail="인증 토큰이 유효하지 않습니다.")
 
-# ==========================================
 # 6. API 엔드포인트
-# ==========================================
-
 @app.get("/api/health")
 def health_check():
     return {"status": "healthy", "database_connected": DATABASE_URL is not None}
@@ -106,19 +80,13 @@ def create_report(data: CrawlJobCreate, email: str = Depends(verify_token)):
         "progress": 0,
         "started_at": now_iso()
     }
-    # 백그라운드 실행
     executor.submit(run_crawl_task, job_id, data.merchant_id)
     return {"job_id": job_id}
 
 def run_crawl_task(job_id, merchant_id):
     try:
-        # 1. 실제 크롤링 로직 시뮬레이션
-        time.sleep(5) 
-        
-        # 2. 결과 데이터 생성
+        time.sleep(5) # 크롤링 시뮬레이션
         report_data = {"merchant_name": merchant_id, "summary": {"total_mentions": 150}}
-        
-        # 3. 완료 상태 업데이트
         CRAWL_JOBS[job_id].update({
             "status": "done",
             "message": "수집이 완료되었습니다.",
@@ -140,11 +108,7 @@ def get_job_status(job_id: str, email: str = Depends(verify_token)):
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
     return job
 
-# ==========================================
-# 7. 서버 실행 설정
-# ==========================================
 if __name__ == "__main__":
     import uvicorn
-    # Railway 환경변수 PORT가 있으면 사용하고, 없으면 8000 사용
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
