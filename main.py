@@ -79,7 +79,7 @@ def verify_token(auth: HTTPAuthorizationCredentials = Depends(security)):
 def health_check():
     return {"status": "healthy", "database_connected": DATABASE_URL is not None}
 
-@app.post("/api/login")
+@app.post("/api/auth/login")
 def login(data: LoginRequest):
     if data.email == ADMIN_EMAIL and data.password == ADMIN_PASSWORD:
         access_token = jwt.encode({"sub": data.email}, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
