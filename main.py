@@ -10,6 +10,15 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+
+# 모든 출처를 허용하도록 설정을 확장합니다.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 테스트를 위해 모든 도메인 허용
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
