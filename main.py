@@ -4,7 +4,7 @@ import concurrent.futures
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, List, Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -36,8 +36,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = 720
 
-# 상태 저장소
+# 상태 저장소 (메모리 저장소 - 서버 재시작 시 초기화됨)
 CRAWL_JOBS = {}
+MERCHANTS = [] # 가맹점 목록 저장용
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
 # 4. 데이터 모델
@@ -47,6 +48,17 @@ class LoginRequest(BaseModel):
 
 class CrawlJobCreate(BaseModel):
     merchant_id: str
+
+# --- [추가] 가맹점 등록을 위한 데이터 모델 ---
+class MerchantCreate(BaseModel):
+    name: str
+    region: str
+    address: str
+    naver_place_url: Optional[str] = None
+    blog_keywords: Optional[str] = None
+    instagram_hashtags: Optional[str] = None
+    instagram_channel: Optional[str] = None
+    youtube_keywords: Optional[str] = None
 
 # 5. 유틸리티 함수 및 인증
 def now_iso():
@@ -70,6 +82,21 @@ def login(data: LoginRequest):
         access_token = jwt.encode({"sub": data.email}, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
         return {"access_token": access_token, "token_type": "bearer"}
     raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 틀렸습니다.")
+
+# --- [추가] 가맹점 관련 API 엔드포인트 ---
+@app.post("/api/merchants")
+def create_merchant(data: MerchantCreate, email: str = Depends(verify_token)):
+    """신규 가맹점을 등록합니다."""
+    new_merchant = data.dict()
+    new_merchant["id"] = str(uuid4())
+    new_merchant["created_at"] = now_iso()
+    MERCHANTS.append(new_merchant)
+    return {"status": "success", "merchant": new_merchant}
+
+@app.get("/api/merchants")
+def list_merchants(email: str = Depends(verify_token)):
+    """등록된 모든 가맹점 목록을 조회합니다."""
+    return MERCHANTS
 
 @app.post("/api/reports")
 def create_report(data: CrawlJobCreate, email: str = Depends(verify_token)):
