@@ -1,3 +1,4 @@
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -6,16 +7,16 @@ from playwright.async_api import async_playwright
 
 app = FastAPI()
 
-# CORS 설정을 가장 허용적인 범위로 수정합니다.
+# CORS 보안 설정을 완전히 개방합니다 (브라우저 차단 방지)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 모든 도메인 허용
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # GET, POST 등 모든 방식 허용
-    allow_headers=["*"],  # 모든 헤더 허용
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# 데이터 저장소
+# 데이터 저장소 (서버 메모리에 임시 저장)
 MERCHANTS = [
     {"id": "1", "name": "배포차", "region": "서울 신사", "blog_keywords": "신사역 배포차"}
 ]
@@ -29,7 +30,7 @@ class MerchantCreate(BaseModel):
 class ReportRequest(BaseModel):
     merchant_id: str
 
-# 네이버 블로그 크롤링 함수
+# 네이버 블로그 검색 수집 함수
 async def crawl_naver(keyword):
     try:
         async with async_playwright() as p:
@@ -45,12 +46,12 @@ async def crawl_naver(keyword):
             await browser.close()
             return 0
     except Exception as e:
-        print(f"크롤링 에러: {e}")
+        print(f"크롤링 에러 발생: {e}")
         return 0
 
 @app.get("/")
 async def health_check():
-    return {"status": "ok"}
+    return {"status": "ok", "message": "API Server is running"}
 
 @app.get("/api/merchants")
 async def list_merchants():
@@ -72,11 +73,11 @@ async def create_report(req: ReportRequest):
     job_id = str(uuid.uuid4())
     m = next((i for i in MERCHANTS if i["id"] == req.merchant_id), None)
     if not m:
-        raise HTTPException(status_code=404, detail="매장을 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="Merchant not found")
     
     CRAWL_JOBS[job_id] = {"status": "running"}
     
-    # 실제 크롤링 수행
+    # 크롤링 실행
     cnt = await crawl_naver(m["blog_keywords"])
     
     CRAWL_JOBS[job_id] = {
@@ -95,3 +96,7 @@ async def create_report(req: ReportRequest):
 @app.get("/api/crawl-jobs/{job_id}")
 async def get_job(job_id: str):
     return CRAWL_JOBS.get(job_id, {"status": "not_found"})
+
+# Railway에서 서버를 직접 띄우기 위한 설정
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
