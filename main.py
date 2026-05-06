@@ -6,7 +6,6 @@ import os
 
 app = FastAPI()
 
-# 모든 통신 보안 해제 (Vercel 접속 허용)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,45 +14,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 데이터 저장소
+# [삭제 기능 대신] 리스트 초기화: 서버 재시작 시 배포차 1개만 남도록 설정
 MERCHANTS = [{"id": "1", "name": "배포차", "region": "서울 신사"}]
 
-class MerchantCreate(BaseModel):
-    name: str
-    region: str = ""
-
-@app.get("/")
-async def health():
-    return {"status": "ok"}
-
-# [해결] 매장 목록 불러오기 (GET)
 @app.get("/api/merchants")
 async def list_merchants():
     return MERCHANTS
 
-# [해결] 새 매장 등록하기 (POST) - 405 에러 해결 포인트
 @app.post("/api/merchants")
-async def add_merchant(m: MerchantCreate):
-    new_m = {"id": str(len(MERCHANTS) + 1), "name": m.name, "region": m.region}
+async def add_merchant(m: dict):
+    # ID를 숫자가 아닌 문자열로 명확히 지정
+    new_id = str(len(MERCHANTS) + 1)
+    new_m = {"id": new_id, "name": m.get("name"), "region": m.get("region", "")}
     MERCHANTS.append(new_m)
     return new_m
-
-# [해결] 분석 리포트 생성 및 조회
-@app.post("/api/reports")
-@app.get("/api/crawl-jobs/{job_id}")
-async def get_report_mock(job_id: str = "1"):
-    return {
-        "status": "completed",
-        "mentionCount": 154,
-        "positiveRate": 85,
-        "sentiment": "긍정",
-        "keywords": ["안주 맛집", "신사역 핫플"],
-        "summary": "온라인 언급량이 급증하고 있으며 긍정적인 반응이 지배적입니다."
-    }
 
 @app.post("/api/auth/login")
 async def login():
     return {"access_token": "success"}
+
+# [핵심] 수집 중 문구 이후 결과 화면을 띄우기 위한 응답 보강
+@app.post("/api/reports")
+async def create_report(m: dict):
+    m_id = str(m.get("merchantId", "1"))
+    # 프론트엔드가 UI를 그리도록 모든 필수 필드 포함
+    return {
+        "id": m_id,
+        "merchantId": m_id,
+        "status": "completed",
+        "mentionCount": 154,
+        "positiveRate": 85,
+        "sentiment": "긍정",
+        "keywords": ["안주 맛집", "신사역 핫플", "가성비"],
+        "summary": "최근 블로그 언급량이 20% 증가했으며 긍정적인 평가가 많습니다.",
+        "reportDate": "2026-05-06"
+    }
+
+# 프론트엔드의 polling(반복 호출)에 대응
+@app.get("/api/crawl-jobs/{job_id}")
+async def get_crawl_job(job_id: str):
+    return await create_report({"merchantId": job_id})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
