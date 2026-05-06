@@ -1,7 +1,6 @@
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import os
 
 app = FastAPI()
@@ -14,7 +13,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 초기 리스트 정리
+# 리스트 초기화 (중복 제거 효과)
 MERCHANTS = [{"id": "1", "name": "배포차", "region": "서울 신사"}]
 
 @app.get("/api/merchants")
@@ -30,32 +29,34 @@ async def add_merchant(m: dict):
 
 @app.post("/api/auth/login")
 async def login():
-    return {"access_token": "success", "token_type": "bearer"}
+    return {"access_token": "success"}
 
-# [핵심 수정] 프론트엔드 UI를 강제로 깨우는 데이터 구조
-def get_mock_report(m_id="1"):
-    return {
-        "id": m_id,
-        "merchantId": m_id,
-        "jobId": m_id,
-        "status": "completed", # 로딩을 멈추게 하는 핵심 키워드
-        "mentionCount": 154,    # 반드시 숫자여야 함
-        "positiveRate": 85,     # 그래프를 그리는 핵심 숫자
-        "sentiment": "긍정",
-        "keywords": ["안주 맛집", "신사역 핫플", "가성비"],
-        "summary": "최근 블로그 언급량이 20% 증가했으며 안주의 가성비에 대한 만족도가 매우 높습니다.",
-        "analysisDate": "2026-05-06"
-    }
-
+# [핵심] 리포트 생성 시 jobId를 명확히 반환
 @app.post("/api/reports")
 async def create_report(m: dict):
-    return get_mock_report(str(m.get("merchantId", "1")))
+    m_id = str(m.get("merchantId", "1"))
+    return {
+        "id": m_id,
+        "jobId": m_id,
+        "status": "completed",
+        "mentionCount": 154,
+        "positiveRate": 85,
+        "sentiment": "긍정",
+        "keywords": ["안주 맛집", "신사역 핫플", "가성비"],
+        "summary": "온라인 언급량이 급증하고 있으며 긍정적인 반응이 지배적입니다."
+    }
 
-@app.get("/api/crawl-jobs/{job_id}")
+# [해결사] /undefined 또는 어떤 ID가 들어와도 무조건 완료 데이터를 반환
+@app.api_route("/api/crawl-jobs/{job_id}", methods=["GET", "OPTIONS"])
 async def get_crawl_job(job_id: str):
-    # undefined로 들어와도 무조건 배포차 데이터를 반환
-    target_id = "1" if job_id == "undefined" else job_id
-    return get_mock_report(target_id)
+    return {
+        "status": "completed",
+        "mentionCount": 154,
+        "positiveRate": 85,
+        "sentiment": "긍정",
+        "keywords": ["안주 맛집", "신사역 핫플"],
+        "summary": "분석이 모두 완료되었습니다. 리포트 대시보드를 확인하세요."
+    }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
