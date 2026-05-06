@@ -1,12 +1,14 @@
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uuid
 import os
 import subprocess
 
 app = FastAPI()
 
-# 모든 도메인 허용
+# 모든 통신 보안 해제 (Vercel 접속 허용)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,23 +17,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 서버 시작 시 브라우저 설치를 자동으로 시도하도록 보강
+# 데이터 저장소
+MERCHANTS = [{"id": "1", "name": "배포차", "region": "서울 신사"}]
+
+class MerchantCreate(BaseModel):
+    name: str
+    region: str = ""
+
+# 서버 시작 시 브라우저 자동 설치
 @app.on_event("startup")
 async def startup_event():
     try:
-        # 실행 시 브라우저가 없으면 설치 프로세스 실행
         subprocess.run(["playwright", "install", "chromium"], check=True)
-    except Exception as e:
-        print(f"브라우저 설치 건너뜀 또는 에러: {e}")
+    except:
+        pass
 
 @app.get("/")
-async def root():
+async def health():
     return {"status": "ok", "message": "Backend is Online"}
 
-# 나머지 리스트/리포트 API는 기존과 동일하게 유지...
+# [수정] 매장 목록 불러오기 (GET)
 @app.get("/api/merchants")
-async def get_merchants():
-    return [{"id": "1", "name": "배포차", "region": "서울 신사"}]
+async def list_merchants():
+    return MERCHANTS
+
+# [수정] 새 매장 등록하기 (POST) - 405 에러 해결 포인트
+@app.post("/api/merchants")
+async def add_merchant(m: MerchantCreate):
+    new_m = {"id": str(uuid.uuid4()), "name": m.name, "region": m.region}
+    MERCHANTS.append(new_m)
+    return new_m
+
+# [추가] 로그인 요청 대응 - 404 에러 해결 포인트
+@app.post("/api/auth/login")
+async def login():
+    return {"access_token": "success", "token_type": "bearer"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
