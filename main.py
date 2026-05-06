@@ -18,9 +18,9 @@ app.add_middleware(
 
 # 실제 분석 대상 가맹점 정보 (점주 보고용 리스트)
 MERCHANTS = [
-    {"id": "1", "name": "배포차", "region": "서울 신사", "place_id": "1874246830"}, # 예시 ID
-    {"id": "2", "name": "온빈", "region": "신정호", "place_id": "12345678"},
-    {"id": "3", "name": "순자매감자탕", "region": "신정호", "place_id": "87654321"}
+    {"id": "1", "name": "배포차", "region": "서울 신사", "place_id": "2034193340"}, # 예시 ID
+    {"id": "2", "name": "온빈", "region": "신정호", "place_id": "2056888634"},
+    {"id": "3", "name": "순자매감자탕", "region": "신정호", "place_id": "2035203541"}
 ]
 
 @app.get("/api/merchants")
