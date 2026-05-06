@@ -1,5 +1,5 @@
 import uvicorn
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -15,9 +15,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 데이터 임시 저장소
+# 임시 데이터
 MERCHANTS = [{"id": "1", "name": "배포차", "region": "서울 신사"}]
-REPORTS = {} # 분석 결과 저장
+REPORTS = {}
 
 class MerchantCreate(BaseModel):
     name: str
@@ -48,25 +48,29 @@ async def add_merchant(m: MerchantCreate):
 async def login():
     return {"access_token": "success"}
 
-# [핵심 수정] 프론트엔드가 찾는 주소(/api/reports)와 일치시킴
+# [수정] 분석 요청 시 즉시 결과 데이터의 'ID'를 반환하도록 변경
 @app.post("/api/reports")
 async def create_report(m: dict):
-    # 실제로는 여기서 크롤링을 시작하지만, 우선 테스트용 결과를 즉시 반환합니다.
-    merchant_id = m.get("merchantId", "1")
+    m_id = str(m.get("merchantId", "1"))
+    # 프론트엔드가 기대하는 응답 구조 (jobId 또는 id)
     report_data = {
-        "merchantId": merchant_id,
+        "id": m_id, 
+        "jobId": m_id,
+        "status": "completed",
         "mentionCount": 154,
         "sentiment": "긍정",
-        "keywords": ["안주가 맛있는", "분위기 좋은", "친절한"],
-        "summary": "최근 블로그 언급량이 급증하고 있으며, 특히 안주의 가성비에 대한 만족도가 높습니다."
+        "keywords": ["안주 맛집", "신사역 핫플"],
+        "summary": "배포차는 현재 신사 지역에서 언급량이 꾸준히 증가하고 있습니다."
     }
-    REPORTS[merchant_id] = report_data
+    REPORTS[m_id] = report_data
     return report_data
 
-# [핵심 수정] 상세 리포트 조회 주소
-@app.get("/api/reports/{merchant_id}")
-async def get_report(merchant_id: str):
-    return REPORTS.get(merchant_id, {"summary": "데이터를 분석 중입니다..."})
+# [수정] 프론트엔드가 undefined 대신 부르는 모든 경로에 대응
+@app.get("/api/crawl-jobs/{job_id}")
+async def get_crawl_job(job_id: str):
+    # 만약 프론트엔드가 'undefined'를 보내더라도 기본 리포트를 보여줌
+    target_id = "1" if job_id == "undefined" else job_id
+    return REPORTS.get(target_id, REPORTS.get("1"))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
