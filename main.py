@@ -413,102 +413,115 @@ def _collect_blog_links(page, links: list, seen_urls: set):
 # ════════════════════════════════════════════════════════════
 # STEP 3: 블로그 원문 방문 → 광고 판별
 # ════════════════════════════════════════════════════════════
-def classify_blog_originals(blog_links: List[Dict]) -> List[Dict]:
+def classify_blog_originals(blog_links: List[Dict],
+                             progress_cb=None) -> List[Dict]:
     """
     각 블로그 원문에 직접 방문하여 본문 전체 텍스트로 광고 판별
-    네이버 블로그 iframe(mainFrame) 처리 포함
+    - 타임아웃: 페이지 8초 / iframe 3초 (기존 20초→8초로 단축)
+    - progress_cb(done, total): 건별 진행률 콜백
+    - 원문 접근 실패 시 excerpt 텍스트로 즉시 판별 (블로킹 없음)
     """
     if not blog_links:
         return []
+
     results = []
+    total = len(blog_links)
+
+    def _visit_one(ctx, item, idx):
+        """단일 블로그 원문 방문 및 판별"""
+        page = ctx.new_page()
+        try:
+            url = item["url"].replace("m.blog.naver.com", "blog.naver.com")
+            page.goto(url, wait_until="domcontentloaded", timeout=8000)
+            page.wait_for_timeout(800)   # 최소 대기만
+
+            full_text = ""
+
+            # 네이버 블로그 iframe(mainFrame) 처리
+            try:
+                frame = page.frame(name="mainFrame")
+                if frame:
+                    frame.wait_for_load_state("domcontentloaded", timeout=3000)
+                    for sel in [".se-main-container", "#postViewArea", ".post-view", "body"]:
+                        try:
+                            el = frame.locator(sel).first
+                            if el.is_visible(timeout=500):
+                                full_text = el.inner_text()
+                                break
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            if not full_text:
+                try:
+                    full_text = page.inner_text("body")
+                except Exception:
+                    full_text = ""
+
+            ad_type = classify_ad(full_text)
+
+            title = item.get("title", "")
+            if not title:
+                try:
+                    title = page.title()[:120]
+                except Exception:
+                    pass
+
+            return {
+                "title": title or "제목 없음",
+                "text": full_text[:500],
+                "ad_type": ad_type,
+                "ad_basis": get_basis(full_text, ad_type),
+                "source": "naver_blog",
+                "url": item["url"],
+            }
+
+        except Exception as e:
+            excerpt = item.get("excerpt", "")
+            ad_type = classify_ad(excerpt)
+            return {
+                "title": item.get("title", "제목 없음"),
+                "text": excerpt[:500],
+                "ad_type": ad_type,
+                "ad_basis": f"원문 접근 실패, 미리보기로 판별",
+                "source": "naver_blog",
+                "url": item.get("url", ""),
+            }
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
 
     try:
         with sync_playwright() as p:
             browser, ctx = make_browser(p, mobile=False)
 
-            for item in blog_links:
-                page = ctx.new_page()
-                try:
-                    url = item["url"].replace("m.blog.naver.com", "blog.naver.com")
-                    page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                    page.wait_for_timeout(2000)
+            for idx, item in enumerate(blog_links):
+                result = _visit_one(ctx, item, idx)
+                results.append(result)
 
-                    full_text = ""
+                # 건별 진행률 콜백
+                if progress_cb:
+                    progress_cb(idx + 1, total)
 
-                    # ── 네이버 블로그: mainFrame iframe 처리 ──
-                    try:
-                        frame = page.frame(name="mainFrame")
-                        if frame:
-                            frame.wait_for_load_state("domcontentloaded", timeout=5000)
-                            # 본문 영역만 추출
-                            for body_sel in [
-                                ".se-main-container",  # 스마트에디터 ONE
-                                "#postViewArea",       # 구버전
-                                ".post-view",
-                                "body",
-                            ]:
-                                try:
-                                    el = frame.locator(body_sel).first
-                                    if el.is_visible(timeout=1000):
-                                        full_text = el.inner_text()
-                                        break
-                                except Exception:
-                                    continue
-                    except Exception:
-                        pass
-
-                    # iframe 없거나 실패 시 페이지 전체
-                    if not full_text:
-                        full_text = page.inner_text("body")
-
-                    ad_type = classify_ad(full_text)
-                    basis = get_basis(full_text, ad_type)
-
-                    # 제목: 페이지 title 태그 우선
-                    title = item.get("title", "")
-                    if not title:
-                        try:
-                            title = page.title()[:120]
-                        except Exception:
-                            pass
-
-                    results.append({
-                        "title": title or "제목 없음",
-                        "text": full_text[:500],
-                        "ad_type": ad_type,
-                        "ad_basis": basis,
-                        "source": "naver_blog",
-                        "url": item["url"],
-                    })
-
-                except Exception as e:
-                    # 원문 접근 실패 → excerpt 텍스트로 판별
-                    excerpt = item.get("excerpt", "")
-                    ad_type = classify_ad(excerpt)
-                    results.append({
-                        "title": item.get("title", "제목 없음"),
-                        "text": excerpt[:500],
-                        "ad_type": ad_type,
-                        "ad_basis": f"원문 접근 실패, 미리보기로 판별 ({str(e)[:40]})",
-                        "source": "naver_blog",
-                        "url": item.get("url", ""),
-                    })
-                finally:
-                    page.close()
+                print(f"[블로그 원문] {idx+1}/{total} {result['ad_type']} - {result['title'][:30]}")
 
             browser.close()
 
     except Exception as e:
         print(f"[블로그 원문 전체 오류] {e}")
-        # 전체 실패 시 excerpt로 판별
-        for item in blog_links:
+        # 브라우저 전체 실패 → 모든 나머지를 excerpt로 즉시 판별
+        already_done = len(results)
+        for item in blog_links[already_done:]:
             text = item.get("excerpt", "")
             ad_type = classify_ad(text)
             results.append({
                 "title": item.get("title", "제목 없음"),
                 "text": text[:500],
                 "ad_type": ad_type,
-                "ad_basis": get_basis(text, ad_type) + " (미리보기 기반)",
+                "ad_basis": get_basis(text, ad_type) + " (브라우저 오류, 미리보기 기반)",
                 "source": "naver_blog",
                 "url": item.get("url", ""),
             })
@@ -645,8 +658,15 @@ def crawl_merchant(job_id: str, merchant: Dict):
         blog_links = crawl_blog_links(place_id, target=min(official_b or 50, 60))
         upd(58, f"블로그 링크 {len(blog_links)}건 확보, 원문 방문 중...")
 
-        # 3. 블로그 원문 방문 → 광고 판별
-        blog_reviews = classify_blog_originals(blog_links)
+        # 3. 블로그 원문 방문 → 광고 판별 (건별 진행률 업데이트)
+        blog_total = len(blog_links)
+
+        def blog_progress(done, total):
+            # 58% ~ 75% 구간을 블로그 원문 방문에 배분
+            pct = 58 + int((done / max(total, 1)) * 17)
+            upd(pct, f"블로그 원문 방문 중... ({done}/{total}건 완료)")
+
+        blog_reviews = classify_blog_originals(blog_links, progress_cb=blog_progress)
         result["naver_blog_reviews"] = blog_reviews
         upd(75, f"블로그리뷰 {len(blog_reviews)}건 분석 완료")
 
