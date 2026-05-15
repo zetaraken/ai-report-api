@@ -287,7 +287,10 @@ def crawl_receipt_reviews(place_id: str, target: int = 300) -> List[Dict]:
     calls = list(graphql_calls.values())
     print(f"[영수증] 가로채기: {len(calls)}개 요청, {len(reviews)}건 추출")
     for c in calls:
-        print(f"  - {c['method']} {c['url'][:70]} body={c.get('body','')[:60]}")
+        body_preview = c.get('body', '')[:200]
+        print(f"  URL: {c['url'][:80]}")
+        print(f"  METHOD: {c['method']}")
+        print(f"  BODY: {body_preview}")
 
     # ── GraphQL POST 페이지네이션 ───────────────────────────────
     if len(reviews) < target:
@@ -421,7 +424,12 @@ def _extract_review_texts(data, reviews: list, seen_texts: set):
 
 def _crawl_receipt_playwright_scroll(place_id: str, target: int,
                                       seen_texts: set) -> list:
-    """Playwright 전체 스크롤 폴백 — 리뷰 li 요소 직접 수집"""
+    """
+    Playwright 전체 스크롤 폴백
+    - 더보기(펼쳐서 더보기) 버튼 클릭으로 텍스트 펼치기
+    - page.evaluate()로 JS에서 직접 DOM 텍스트 추출
+    - 스크롤로 무한 로드
+    """
     reviews = []
     try:
         with sync_playwright() as p:
@@ -434,58 +442,89 @@ def _crawl_receipt_playwright_scroll(place_id: str, target: int,
             page.wait_for_timeout(3000)
 
             no_new = 0
-            for i in range(300):  # 최대 300회 스크롤
+            for i in range(400):  # 최대 400회 스크롤 (239건 × 스크롤당 1건 기준)
                 prev = len(reviews)
 
-                # 펼쳐서 더보기 버튼 전부 클릭
-                for btn in page.locator("button:has-text('펼쳐서 더보기')").all():
-                    try:
-                        btn.scroll_into_view_if_needed()
-                        btn.click()
-                        page.wait_for_timeout(200)
-                    except Exception:
-                        pass
+                # JS로 DOM에서 리뷰 텍스트 직접 추출
+                texts = page.evaluate("""
+                    () => {
+                        const results = [];
+                        // 방법1: 리뷰 li 아이템의 텍스트 span
+                        const spans = document.querySelectorAll(
+                            'li span.pui__Ic-pg, li .pui__vn15t2, li span[class*="body"]'
+                        );
+                        spans.forEach(el => {
+                            const t = el.innerText.trim();
+                            if (t.length >= 10) results.push(t);
+                        });
+                        // 방법2: 리뷰 li 전체
+                        if (results.length === 0) {
+                            const lis = document.querySelectorAll(
+                                'li.pui__X35jYm, li[data-laim-exp-id]'
+                            );
+                            lis.forEach(el => {
+                                const t = el.innerText.trim();
+                                if (t.length >= 10) results.push(t);
+                            });
+                        }
+                        // 방법3: 리뷰 섹션 내 p 태그
+                        if (results.length === 0) {
+                            const ps = document.querySelectorAll(
+                                'div[class*="Review"] p, div[class*="review"] p'
+                            );
+                            ps.forEach(el => {
+                                const t = el.innerText.trim();
+                                if (t.length >= 10) results.push(t);
+                            });
+                        }
+                        return results;
+                    }
+                """)
 
-                # 리뷰 텍스트 수집 (여러 셀렉터 시도)
-                for sel in [
-                    "li.pui__X35jYm span.pui__Ic-pg",
-                    "li[data-laim-exp-id] span",
-                    ".pui__vn15t2",
-                    "li.pui__X35jYm",
-                    "[class*='ReviewItem'] p",
-                    "[class*='review_item'] span",
-                ]:
-                    try:
-                        els = page.locator(sel).all()
-                        for el in els:
-                            try:
-                                text = el.inner_text().strip()
-                                if (len(text) >= 10
-                                        and text not in seen_texts
-                                        and "펼쳐서 더보기" not in text
-                                        and "반응 남기기" not in text):
-                                    seen_texts.add(text)
-                                    ad_type = classify_ad(text)
-                                    reviews.append({
-                                        "text": text[:500],
-                                        "ad_type": ad_type,
-                                        "ad_basis": get_basis(text, ad_type),
-                                        "source": "naver_receipt",
-                                    })
-                            except Exception:
-                                continue
-                    except Exception:
-                        continue
+                SKIP = {"펼쳐서 더보기", "더보기", "접기", "반응 남기기",
+                        "좋아요", "신고", "사진보기"}
+                for text in (texts or []):
+                    text = text.strip()
+                    if (len(text) >= 10
+                            and text not in seen_texts
+                            and not any(s in text for s in SKIP)):
+                        seen_texts.add(text)
+                        ad_type = classify_ad(text)
+                        reviews.append({
+                            "text": text[:500],
+                            "ad_type": ad_type,
+                            "ad_basis": get_basis(text, ad_type),
+                            "source": "naver_receipt",
+                        })
 
                 if len(reviews) >= target:
                     break
 
-                page.evaluate("window.scrollBy(0, 800)")
-                page.wait_for_timeout(800)
+                # 더보기 버튼 클릭
+                try:
+                    btns = page.locator(
+                        "button:has-text('더보기'), "
+                        "a:has-text('더보기'), "
+                        "span:has-text('더보기')"
+                    ).all()
+                    for btn in btns[:5]:
+                        try:
+                            if btn.is_visible(timeout=300):
+                                btn.scroll_into_view_if_needed()
+                                btn.click()
+                                page.wait_for_timeout(150)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                page.evaluate("window.scrollBy(0, 600)")
+                page.wait_for_timeout(700)
 
                 if len(reviews) == prev:
                     no_new += 1
-                    if no_new >= 8:
+                    if no_new >= 10:
+                        print(f"[영수증 스크롤] {i}회 후 종료. 수집: {len(reviews)}건")
                         break
                 else:
                     no_new = 0
