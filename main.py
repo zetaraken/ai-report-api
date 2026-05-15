@@ -302,10 +302,12 @@ def _collect_receipt_texts(page, reviews: list, seen: set):
 # ════════════════════════════════════════════════════════════
 # STEP 2: 블로그 리뷰 목록 수집 — Playwright 스크롤
 # ════════════════════════════════════════════════════════════
-def crawl_blog_links(place_id: str, target: int = 50) -> List[Dict]:
+def crawl_blog_links(place_id: str, target: int = 50,
+                     progress_cb=None) -> List[Dict]:
     """
     네이버 플레이스 블로그 리뷰 목록에서 링크 수집
     더보기 반복 클릭으로 최대 target건
+    progress_cb(current, target): 클릭마다 진행률 콜백
     """
     links = []
     seen_urls = set()
@@ -317,17 +319,21 @@ def crawl_blog_links(place_id: str, target: int = 50) -> List[Dict]:
 
             page.goto(
                 f"https://m.place.naver.com/restaurant/{place_id}/review/ugc",
-                wait_until="domcontentloaded", timeout=30000
+                wait_until="domcontentloaded", timeout=20000
             )
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(1500)   # 3000 → 1500
 
             no_new_count = 0
             click_count = 0
-            max_clicks = 20
+            max_clicks = 15  # 20 → 15
 
             while click_count < max_clicks:
                 prev = len(seen_urls)
                 _collect_blog_links(page, links, seen_urls)
+
+                # 진행률 콜백 (클릭마다)
+                if progress_cb:
+                    progress_cb(len(links), target)
 
                 if len(links) >= target:
                     break
@@ -341,10 +347,10 @@ def crawl_blog_links(place_id: str, target: int = 50) -> List[Dict]:
                 ]:
                     try:
                         btn = page.locator(sel).last
-                        if btn.is_visible(timeout=1500):
+                        if btn.is_visible(timeout=1000):  # 1500 → 1000
                             btn.scroll_into_view_if_needed()
                             btn.click()
-                            page.wait_for_timeout(1800)
+                            page.wait_for_timeout(1200)   # 1800 → 1200
                             clicked = True
                             break
                     except Exception:
@@ -352,7 +358,7 @@ def crawl_blog_links(place_id: str, target: int = 50) -> List[Dict]:
 
                 if not clicked:
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(800)   # 1500 → 800
 
                 click_count += 1
 
@@ -648,25 +654,30 @@ def crawl_merchant(job_id: str, merchant: Dict):
         # 1. 영수증(방문자) 리뷰 전체 수집
         official_r = counts.get("receipt_total", 0)
         upd(10, f"영수증리뷰 수집 중... (공식 {official_r}건)")
-        receipt = crawl_receipt_reviews(place_id, target=min(official_r or 100, 150))
+        receipt = crawl_receipt_reviews(place_id, target=min(official_r or 100, 100))
         result["naver_receipt_reviews"] = receipt
         upd(40, f"영수증리뷰 {len(receipt)}건 수집 완료")
 
-        # 2. 블로그 리뷰 목록 수집
+        # 2. 블로그 리뷰 목록 수집 (43~58% 구간 — 클릭마다 갱신)
         official_b = counts.get("blog_total", 0)
-        upd(43, f"블로그리뷰 목록 수집 중... (공식 {official_b}건)")
-        blog_links = crawl_blog_links(place_id, target=min(official_b or 50, 60))
-        upd(58, f"블로그 링크 {len(blog_links)}건 확보, 원문 방문 중...")
+        blog_target = min(official_b or 30, 30)   # 최대 30건으로 제한
 
-        # 3. 블로그 원문 방문 → 광고 판별 (건별 진행률 업데이트)
-        blog_total = len(blog_links)
+        def blog_list_progress(current, total):
+            # 43% ~ 56% 구간
+            pct = 43 + int((min(current, total) / max(total, 1)) * 13)
+            upd(pct, f"블로그리뷰 목록 수집 중... ({current}건 / 목표 {total}건)")
 
-        def blog_progress(done, total):
-            # 58% ~ 75% 구간을 블로그 원문 방문에 배분
-            pct = 58 + int((done / max(total, 1)) * 17)
+        upd(43, f"블로그리뷰 목록 수집 중... (공식 {official_b}건, 최대 {blog_target}건 수집)")
+        blog_links = crawl_blog_links(place_id, target=blog_target,
+                                       progress_cb=blog_list_progress)
+        upd(57, f"블로그 링크 {len(blog_links)}건 확보, 원문 방문 시작...")
+
+        # 3. 블로그 원문 방문 → 광고 판별 (57~75% 구간 — 건별 갱신)
+        def blog_orig_progress(done, total):
+            pct = 57 + int((done / max(total, 1)) * 18)
             upd(pct, f"블로그 원문 방문 중... ({done}/{total}건 완료)")
 
-        blog_reviews = classify_blog_originals(blog_links, progress_cb=blog_progress)
+        blog_reviews = classify_blog_originals(blog_links, progress_cb=blog_orig_progress)
         result["naver_blog_reviews"] = blog_reviews
         upd(75, f"블로그리뷰 {len(blog_reviews)}건 분석 완료")
 
