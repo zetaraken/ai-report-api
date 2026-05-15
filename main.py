@@ -219,81 +219,75 @@ def get_official_counts(place_id: str) -> Dict:
 # ════════════════════════════════════════════════════════════
 # STEP 1: 영수증(방문자) 리뷰 — Playwright 스크롤+더보기 반복
 # ════════════════════════════════════════════════════════════
-def crawl_receipt_reviews(place_id: str, target: int = 100) -> List[Dict]:
+def crawl_receipt_reviews(place_id: str, target: int = 250) -> List[Dict]:
     """
     네이버 플레이스 방문자(영수증) 리뷰 수집
     - 더보기 버튼 반복 클릭 + 스크롤로 최대 target건 수집
-    - 텍스트가 있는 리뷰만 추출 (별점만 있는 리뷰 제외)
+    - 텍스트 있는 리뷰만 저장, 별점만 있는 리뷰는 seen에서 제외
     """
     reviews = []
-    seen = set()
+    seen_texts = set()   # 텍스트 중복 방지
+    seen_count = 0       # 렌더링된 총 리뷰 수 (텍스트 없는 것 포함)
 
     try:
         with sync_playwright() as p:
             browser, ctx = make_browser(p, mobile=True)
             page = ctx.new_page()
 
-            # 방문자 리뷰 탭 직접 진입
             page.goto(
                 f"https://m.place.naver.com/restaurant/{place_id}/review/visitor",
                 wait_until="domcontentloaded", timeout=30000
             )
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(2500)
 
-            # ── 더보기 반복 클릭으로 리뷰 로드 ──────────────────
             more_click_count = 0
-            max_clicks = 30  # 최대 클릭 횟수 (리뷰 10건/클릭 × 30 = ~300건)
+            max_clicks = 50   # 10건/클릭 × 50 = ~500건 커버
             no_new_count = 0
 
             while more_click_count < max_clicks:
-                prev_count = len(seen)
+                prev_review_count = len(reviews)
 
-                # 현재 페이지의 리뷰 텍스트 수집
-                _collect_receipt_texts(page, reviews, seen)
+                _collect_receipt_texts(page, reviews, seen_texts)
 
-                # 목표 건수 달성 시 종료
                 if len(reviews) >= target:
                     break
 
-                # 더보기 버튼 탐색 (다양한 셀렉터)
+                # 더보기 버튼 탐색
                 clicked = False
-                more_selectors = [
+                for sel in [
                     "a.place_bluelink:has-text('더보기')",
                     "button:has-text('더보기')",
                     "a:has-text('더보기')",
                     "span:has-text('더보기')",
                     "[class*='more']:has-text('더보기')",
-                ]
-                for sel in more_selectors:
+                ]:
                     try:
                         btn = page.locator(sel).last
-                        if btn.is_visible(timeout=1500):
+                        if btn.is_visible(timeout=1200):
                             btn.scroll_into_view_if_needed()
                             btn.click()
-                            page.wait_for_timeout(1800)
+                            page.wait_for_timeout(1500)
                             clicked = True
                             break
                     except Exception:
                         continue
 
                 if not clicked:
-                    # 스크롤로 추가 로드 시도
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(1200)
 
                 more_click_count += 1
 
-                # 새로 추가된 리뷰가 없으면 카운트
-                if len(seen) == prev_count:
+                # 새로 추가된 리뷰 텍스트가 없으면 카운트
+                if len(reviews) == prev_review_count:
                     no_new_count += 1
-                    if no_new_count >= 3:
-                        print(f"[영수증] 더 이상 새 리뷰 없음. 종료.")
+                    if no_new_count >= 4:
+                        print(f"[영수증] 더 이상 새 텍스트리뷰 없음. 종료.")
                         break
                 else:
                     no_new_count = 0
 
-            # 마지막 한 번 더 수집
-            _collect_receipt_texts(page, reviews, seen)
+            _collect_receipt_texts(page, reviews, seen_texts)
             browser.close()
 
     except Exception as e:
@@ -303,16 +297,15 @@ def crawl_receipt_reviews(place_id: str, target: int = 100) -> List[Dict]:
     return reviews
 
 
-def _collect_receipt_texts(page, reviews: list, seen: set):
-    """현재 페이지에서 리뷰 텍스트 추출 (중복 제외)"""
-    # 네이버 플레이스 리뷰 셀렉터 (여러 버전 대응)
+def _collect_receipt_texts(page, reviews: list, seen_texts: set):
+    """현재 페이지에서 리뷰 텍스트 추출 (중복 제외, 텍스트 있는 것만)"""
     selectors = [
-        "li.pui__X35jYm",           # 구버전
+        "li.pui__X35jYm",
         "div.place_section_content li",
         "li[class*='ReviewItem']",
         "div[class*='ReviewItem']",
         "li[data-laim-exp-id]",
-        ".pui__vn15t2",             # 2024년~
+        ".pui__vn15t2",
         "div[class*='review_item']",
     ]
 
@@ -327,7 +320,6 @@ def _collect_receipt_texts(page, reviews: list, seen: set):
             continue
 
     if not collected:
-        # 최후 수단: 텍스트가 긴 span/p 태그
         try:
             collected = page.locator("span.pui__Ic-pg, p.pui__xtsQN").all()
         except Exception:
@@ -336,13 +328,14 @@ def _collect_receipt_texts(page, reviews: list, seen: set):
     for el in collected:
         try:
             text = el.inner_text().strip()
-            # 너무 짧거나 이미 수집한 텍스트 제외
-            if len(text) < 10 or text in seen:
+            # 너무 짧은 것, 버튼 텍스트, 중복 제외
+            if len(text) < 10:
                 continue
-            # UI 텍스트 필터링 (버튼명 등)
-            if text in ("더보기", "접기", "좋아요", "신고"):
+            if text in ("더보기", "접기", "좋아요", "신고", "사진보기"):
                 continue
-            seen.add(text)
+            if text in seen_texts:
+                continue
+            seen_texts.add(text)
             ad_type = classify_ad(text)
             reviews.append({
                 "text": text[:500],
@@ -355,20 +348,155 @@ def _collect_receipt_texts(page, reviews: list, seen: set):
 
 
 # ════════════════════════════════════════════════════════════
-# STEP 2: 블로그 리뷰 목록 수집 — 네이버 검색 API (requests)
-# Playwright 방식은 봇 감지로 블로킹 → requests로 전환
+# STEP 2: 블로그 리뷰 목록 수집
+# 전략: 플레이스 블로그리뷰 탭 + 네트워크 응답 가로채기
+# 네이버 플레이스가 블로그리뷰 목록을 로드할 때 사용하는
+# API 응답을 직접 캡처하여 링크 추출
 # ════════════════════════════════════════════════════════════
 def crawl_blog_links(place_id: str, merchant_name: str = "",
-                     target: int = 30, progress_cb=None) -> List[Dict]:
+                     target: int = 50, progress_cb=None) -> List[Dict]:
     """
-    네이버 블로그 검색 API로 블로그 링크 수집 (빠름, 봇 감지 없음)
-    플레이스 블로그리뷰 탭 대신 네이버 검색에서 가맹점명으로 검색
+    네이버 플레이스 블로그리뷰 탭에서 직접 수집
+    방법 1: 네트워크 응답 가로채기 (JSON API 캡처)
+    방법 2: 페이지 DOM에서 링크 추출 (폴백)
     """
-    import urllib.request
     links = []
     seen_urls = set()
+    captured_responses = []
 
-    # 방법 1: 네이버 검색 HTML 파싱 (requests)
+    try:
+        with sync_playwright() as p:
+            browser, ctx = make_browser(p, mobile=True)
+            page = ctx.new_page()
+
+            # ── 네트워크 응답 가로채기 ──────────────────────────
+            def on_response(response):
+                url = response.url
+                # 블로그리뷰 관련 API 응답 캡처
+                if any(kw in url for kw in [
+                    "ugcReview", "ugc", "review/ugc", "blog",
+                    "visitorReview", "graphql"
+                ]):
+                    try:
+                        if "json" in response.headers.get("content-type", ""):
+                            data = response.json()
+                            captured_responses.append(data)
+                    except Exception:
+                        pass
+
+            page.on("response", on_response)
+
+            # 블로그리뷰 탭 직접 진입
+            page.goto(
+                f"https://m.place.naver.com/restaurant/{place_id}/review/ugc",
+                wait_until="networkidle", timeout=25000
+            )
+            page.wait_for_timeout(2000)
+
+            if progress_cb:
+                progress_cb(5, target)
+
+            # ── 캡처된 API 응답에서 링크 추출 ─────────────────
+            for resp_data in captured_responses:
+                _extract_links_from_json(resp_data, links, seen_urls)
+
+            # ── 더보기 클릭으로 추가 수집 ──────────────────────
+            no_new = 0
+            clicks = 0
+            max_clicks = 10
+
+            while clicks < max_clicks and len(links) < target:
+                prev = len(links)
+
+                # DOM에서도 수집
+                _collect_blog_links(page, links, seen_urls)
+
+                if progress_cb:
+                    progress_cb(len(links), target)
+
+                if len(links) >= target:
+                    break
+
+                # 더보기 클릭
+                clicked = False
+                for sel in [
+                    "a.place_bluelink:has-text('더보기')",
+                    "button:has-text('더보기')",
+                    "a:has-text('더보기')",
+                ]:
+                    try:
+                        btn = page.locator(sel).last
+                        if btn.is_visible(timeout=1000):
+                            btn.scroll_into_view_if_needed()
+                            btn.click()
+                            page.wait_for_timeout(1500)
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+
+                if not clicked:
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(1000)
+
+                clicks += 1
+
+                # 새로 추가된 API 응답에서 추가 수집
+                for resp_data in captured_responses:
+                    _extract_links_from_json(resp_data, links, seen_urls)
+
+                if len(links) == prev:
+                    no_new += 1
+                    if no_new >= 3:
+                        break
+                else:
+                    no_new = 0
+
+            browser.close()
+
+    except Exception as e:
+        print(f"[블로그 목록 오류] {e}")
+
+    # ── 폴백: 여전히 0건이면 네이버 블로그 검색 (지역+가맹점명) ──
+    if not links and merchant_name:
+        print("[블로그 목록] 플레이스 탭 수집 실패 → 네이버 블로그 검색 폴백")
+        links = _crawl_blog_links_via_search(merchant_name, target, seen_urls)
+
+    if progress_cb:
+        progress_cb(len(links), target)
+
+    print(f"[블로그 목록] 최종 수집: {len(links)}건")
+    return links
+
+
+def _extract_links_from_json(data, links: list, seen_urls: set):
+    """캡처된 JSON 응답에서 블로그 URL 재귀 추출"""
+    if isinstance(data, dict):
+        # URL 필드 탐색
+        for key in ["url", "link", "blogUrl", "postUrl", "permalink"]:
+            val = data.get(key, "")
+            if isinstance(val, str) and "blog.naver.com" in val and val not in seen_urls:
+                seen_urls.add(val)
+                title = data.get("title", data.get("subject", ""))
+                excerpt = data.get("contents", data.get("body", data.get("description", "")))
+                links.append({
+                    "url": val,
+                    "title": str(title)[:120],
+                    "excerpt": str(excerpt)[:300],
+                })
+        # 재귀
+        for v in data.values():
+            if isinstance(v, (dict, list)):
+                _extract_links_from_json(v, links, seen_urls)
+    elif isinstance(data, list):
+        for item in data:
+            _extract_links_from_json(item, links, seen_urls)
+
+
+def _crawl_blog_links_via_search(merchant_name: str, target: int,
+                                  seen_urls: set) -> List[Dict]:
+    """네이버 블로그 검색으로 폴백 수집 (지역명 포함 검색)"""
+    links = []
     try:
         import requests as req_lib
         headers = {
@@ -377,96 +505,45 @@ def crawl_blog_links(place_id: str, merchant_name: str = "",
                 "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
             ),
             "Accept-Language": "ko-KR,ko;q=0.9",
-            "Referer": "https://search.naver.com/",
         }
-
-        # 페이지별 수집 (10건/페이지)
-        for start in range(1, target + 1, 10):
+        for start in range(1, min(target, 50) + 1, 10):
             if len(links) >= target:
                 break
             try:
-                url = (
+                r = req_lib.get(
                     f"https://search.naver.com/search.naver"
-                    f"?query={quote(merchant_name)}&where=blog&start={start}"
+                    f"?query={quote(merchant_name)}&where=blog&start={start}",
+                    headers=headers, timeout=8
                 )
-                r = req_lib.get(url, headers=headers, timeout=8)
                 html = r.text
-
-                # 블로그 링크 추출 (정규식)
                 blog_urls = re.findall(
-                    r'href="(https?://(?:blog\.naver\.com|m\.blog\.naver\.com|post\.naver\.com)[^"]+)"',
+                    r'href="(https?://(?:blog\.naver\.com|post\.naver\.com)[^"]+)"',
                     html
                 )
-                titles = re.findall(
+                titles_raw = re.findall(
                     r'<a[^>]+class="[^"]*title[^"]*"[^>]*>(.*?)</a>',
                     html, re.DOTALL
                 )
-                # HTML 태그 제거
-                clean_titles = [re.sub(r'<[^>]+>', '', t).strip() for t in titles]
+                clean_titles = [re.sub(r'<[^>]+>', '', t).strip() for t in titles_raw]
 
                 for i, u in enumerate(blog_urls):
                     if u in seen_urls or len(links) >= target:
                         break
-                    # 프로필·목록 페이지 제외
                     if any(x in u for x in ["PostList", "?tab=", "/profile"]):
                         continue
                     seen_urls.add(u)
                     title = clean_titles[i] if i < len(clean_titles) else ""
                     links.append({"url": u, "title": title[:120], "excerpt": ""})
-
-                if progress_cb:
-                    progress_cb(len(links), target)
-
             except Exception as e:
-                print(f"[블로그 검색 page={start}] {e}")
+                print(f"[블로그 검색 폴백 page={start}] {e}")
                 break
-
-    except ImportError:
-        pass
-
-    # 방법 2: requests 실패 시 Playwright 폴백 (간소화)
-    if not links:
-        print("[블로그 목록] requests 실패 → Playwright 폴백")
-        try:
-            with sync_playwright() as p:
-                browser, ctx = make_browser(p, mobile=False)
-                page = ctx.new_page()
-                page.goto(
-                    f"https://search.naver.com/search.naver"
-                    f"?query={quote(merchant_name)}&where=blog",
-                    wait_until="domcontentloaded", timeout=15000
-                )
-                page.wait_for_timeout(1000)
-
-                anchors = page.locator(
-                    "a[href*='blog.naver.com'], a[href*='post.naver.com']"
-                ).all()
-                for a in anchors[:target]:
-                    try:
-                        href = a.get_attribute("href") or ""
-                        if href and href not in seen_urls:
-                            seen_urls.add(href)
-                            try:
-                                title = a.inner_text().strip()[:120]
-                            except Exception:
-                                title = ""
-                            links.append({"url": href, "title": title, "excerpt": ""})
-                    except Exception:
-                        continue
-
-                browser.close()
-        except Exception as e:
-            print(f"[블로그 목록 Playwright 폴백 오류] {e}")
-
-        if progress_cb:
-            progress_cb(len(links), target)
-
-    print(f"[블로그 목록] 수집된 링크: {len(links)}건")
+    except Exception as e:
+        print(f"[블로그 검색 폴백 전체 오류] {e}")
     return links
 
 
 def _collect_blog_links(page, links: list, seen_urls: set):
-    """현재 페이지에서 블로그 링크 추출 (Playwright용 헬퍼)"""
+    """DOM에서 블로그 링크 추출 (Playwright용 헬퍼)"""
     anchors = page.locator(
         "a[href*='blog.naver.com'], a[href*='post.naver.com'], "
         "a[href*='m.blog.naver.com']"
@@ -476,7 +553,7 @@ def _collect_blog_links(page, links: list, seen_urls: set):
             href = a.get_attribute("href") or ""
             if not href or href in seen_urls:
                 continue
-            if any(x in href for x in ["PostList", "photo", "media"]):
+            if any(x in href for x in ["PostList", "photo", "media", "?tab="]):
                 continue
             seen_urls.add(href)
             try:
@@ -743,7 +820,8 @@ def crawl_merchant(job_id: str, merchant: Dict):
         # 1. 영수증(방문자) 리뷰 전체 수집
         official_r = counts.get("receipt_total", 0)
         upd(10, f"영수증리뷰 수집 중... (공식 {official_r}건)")
-        receipt = crawl_receipt_reviews(place_id, target=min(official_r or 100, 100))
+        # target = 공식 수치 그대로, 최대 300건
+        receipt = crawl_receipt_reviews(place_id, target=min(official_r or 250, 300))
         result["naver_receipt_reviews"] = receipt
         upd(40, f"영수증리뷰 {len(receipt)}건 수집 완료")
 
