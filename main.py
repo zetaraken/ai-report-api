@@ -1,16 +1,19 @@
 """
-SNS 분석 자동화 솔루션 - 백엔드 API v3.0
+SNS 분석 자동화 솔루션 - 백엔드 API v3.1
 전략: 내부 API 의존 제거 → Playwright 실제 브라우저 스크롤 방식으로 전면 교체
 - 영수증리뷰: 더보기 버튼 반복 클릭 + 스크롤로 전체 수집
 - 블로그리뷰: 목록 전체 수집 후 원문 방문 광고 판별
 - 공식 수치: 플레이스 홈에서 파싱 (표시용)
+- 파일 기반 영속성: Railway 재배포 후에도 job/report 유지
 """
 
+import json
 import os
 import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import quote
 
@@ -25,7 +28,7 @@ try:
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
-app = FastAPI(title="SNS 분석 솔루션 API", version="3.0.0")
+app = FastAPI(title="SNS 분석 솔루션 API", version="3.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,9 +37,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MERCHANTS: List[Dict] = []
-CRAWL_JOBS: Dict[str, Dict] = {}
-REPORTS: Dict[str, Dict] = {}
+# ── 파일 기반 영속성 저장소 ───────────────────────────────────────
+DATA_DIR = Path("/tmp/sns_analyzer_data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+MERCHANTS_FILE = DATA_DIR / "merchants.json"
+JOBS_DIR       = DATA_DIR / "jobs"
+REPORTS_DIR    = DATA_DIR / "reports"
+JOBS_DIR.mkdir(exist_ok=True)
+REPORTS_DIR.mkdir(exist_ok=True)
+
+def _load_json(path: Path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
+
+def _save_json(path: Path, data):
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[저장 오류] {path}: {e}")
+
+# 인메모리 캐시 (파일에서 초기 로드)
+MERCHANTS: List[Dict] = _load_json(MERCHANTS_FILE, [])
+CRAWL_JOBS: Dict[str, Dict] = {}   # 실행 중인 job만 메모리 유지
+REPORTS: Dict[str, Dict] = {}      # 캐시 (파일이 원본)
+
+def save_merchants():
+    _save_json(MERCHANTS_FILE, MERCHANTS)
+
+def save_job(job: Dict):
+    _save_json(JOBS_DIR / f"{job['id']}.json", job)
+
+def load_job(job_id: str) -> Optional[Dict]:
+    # 메모리 우선, 없으면 파일에서
+    if job_id in CRAWL_JOBS:
+        return CRAWL_JOBS[job_id]
+    data = _load_json(JOBS_DIR / f"{job_id}.json", None)
+    if data:
+        CRAWL_JOBS[job_id] = data
+    return data
+
+def save_report(merchant_id: str, report: Dict):
+    _save_json(REPORTS_DIR / f"{merchant_id}.json", report)
+
+def load_report(merchant_id: str) -> Optional[Dict]:
+    if merchant_id in REPORTS:
+        return REPORTS[merchant_id]
+    data = _load_json(REPORTS_DIR / f"{merchant_id}.json", None)
+    if data:
+        REPORTS[merchant_id] = data
+    return data
+
 executor = ThreadPoolExecutor(max_workers=2)
 
 # ── Pydantic ──────────────────────────────────────────────────────
@@ -300,117 +355,134 @@ def _collect_receipt_texts(page, reviews: list, seen: set):
 
 
 # ════════════════════════════════════════════════════════════
-# STEP 2: 블로그 리뷰 목록 수집 — Playwright 스크롤
+# STEP 2: 블로그 리뷰 목록 수집 — 네이버 검색 API (requests)
+# Playwright 방식은 봇 감지로 블로킹 → requests로 전환
 # ════════════════════════════════════════════════════════════
-def crawl_blog_links(place_id: str, target: int = 50,
-                     progress_cb=None) -> List[Dict]:
+def crawl_blog_links(place_id: str, merchant_name: str = "",
+                     target: int = 30, progress_cb=None) -> List[Dict]:
     """
-    네이버 플레이스 블로그 리뷰 목록에서 링크 수집
-    더보기 반복 클릭으로 최대 target건
-    progress_cb(current, target): 클릭마다 진행률 콜백
+    네이버 블로그 검색 API로 블로그 링크 수집 (빠름, 봇 감지 없음)
+    플레이스 블로그리뷰 탭 대신 네이버 검색에서 가맹점명으로 검색
     """
+    import urllib.request
     links = []
     seen_urls = set()
 
+    # 방법 1: 네이버 검색 HTML 파싱 (requests)
     try:
-        with sync_playwright() as p:
-            browser, ctx = make_browser(p, mobile=True)
-            page = ctx.new_page()
+        import requests as req_lib
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "ko-KR,ko;q=0.9",
+            "Referer": "https://search.naver.com/",
+        }
 
-            page.goto(
-                f"https://m.place.naver.com/restaurant/{place_id}/review/ugc",
-                wait_until="domcontentloaded", timeout=20000
-            )
-            page.wait_for_timeout(1500)   # 3000 → 1500
+        # 페이지별 수집 (10건/페이지)
+        for start in range(1, target + 1, 10):
+            if len(links) >= target:
+                break
+            try:
+                url = (
+                    f"https://search.naver.com/search.naver"
+                    f"?query={quote(merchant_name)}&where=blog&start={start}"
+                )
+                r = req_lib.get(url, headers=headers, timeout=8)
+                html = r.text
 
-            no_new_count = 0
-            click_count = 0
-            max_clicks = 15  # 20 → 15
+                # 블로그 링크 추출 (정규식)
+                blog_urls = re.findall(
+                    r'href="(https?://(?:blog\.naver\.com|m\.blog\.naver\.com|post\.naver\.com)[^"]+)"',
+                    html
+                )
+                titles = re.findall(
+                    r'<a[^>]+class="[^"]*title[^"]*"[^>]*>(.*?)</a>',
+                    html, re.DOTALL
+                )
+                # HTML 태그 제거
+                clean_titles = [re.sub(r'<[^>]+>', '', t).strip() for t in titles]
 
-            while click_count < max_clicks:
-                prev = len(seen_urls)
-                _collect_blog_links(page, links, seen_urls)
+                for i, u in enumerate(blog_urls):
+                    if u in seen_urls or len(links) >= target:
+                        break
+                    # 프로필·목록 페이지 제외
+                    if any(x in u for x in ["PostList", "?tab=", "/profile"]):
+                        continue
+                    seen_urls.add(u)
+                    title = clean_titles[i] if i < len(clean_titles) else ""
+                    links.append({"url": u, "title": title[:120], "excerpt": ""})
 
-                # 진행률 콜백 (클릭마다)
                 if progress_cb:
                     progress_cb(len(links), target)
 
-                if len(links) >= target:
-                    break
+            except Exception as e:
+                print(f"[블로그 검색 page={start}] {e}")
+                break
 
-                # 더보기 클릭
-                clicked = False
-                for sel in [
-                    "a.place_bluelink:has-text('더보기')",
-                    "button:has-text('더보기')",
-                    "a:has-text('더보기')",
-                ]:
+    except ImportError:
+        pass
+
+    # 방법 2: requests 실패 시 Playwright 폴백 (간소화)
+    if not links:
+        print("[블로그 목록] requests 실패 → Playwright 폴백")
+        try:
+            with sync_playwright() as p:
+                browser, ctx = make_browser(p, mobile=False)
+                page = ctx.new_page()
+                page.goto(
+                    f"https://search.naver.com/search.naver"
+                    f"?query={quote(merchant_name)}&where=blog",
+                    wait_until="domcontentloaded", timeout=15000
+                )
+                page.wait_for_timeout(1000)
+
+                anchors = page.locator(
+                    "a[href*='blog.naver.com'], a[href*='post.naver.com']"
+                ).all()
+                for a in anchors[:target]:
                     try:
-                        btn = page.locator(sel).last
-                        if btn.is_visible(timeout=1000):  # 1500 → 1000
-                            btn.scroll_into_view_if_needed()
-                            btn.click()
-                            page.wait_for_timeout(1200)   # 1800 → 1200
-                            clicked = True
-                            break
+                        href = a.get_attribute("href") or ""
+                        if href and href not in seen_urls:
+                            seen_urls.add(href)
+                            try:
+                                title = a.inner_text().strip()[:120]
+                            except Exception:
+                                title = ""
+                            links.append({"url": href, "title": title, "excerpt": ""})
                     except Exception:
                         continue
 
-                if not clicked:
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.wait_for_timeout(800)   # 1500 → 800
+                browser.close()
+        except Exception as e:
+            print(f"[블로그 목록 Playwright 폴백 오류] {e}")
 
-                click_count += 1
-
-                if len(seen_urls) == prev:
-                    no_new_count += 1
-                    if no_new_count >= 3:
-                        break
-                else:
-                    no_new_count = 0
-
-            _collect_blog_links(page, links, seen_urls)
-            browser.close()
-
-    except Exception as e:
-        print(f"[블로그 목록 오류] {e}")
+        if progress_cb:
+            progress_cb(len(links), target)
 
     print(f"[블로그 목록] 수집된 링크: {len(links)}건")
     return links
 
 
 def _collect_blog_links(page, links: list, seen_urls: set):
-    """현재 페이지에서 블로그 링크 추출"""
+    """현재 페이지에서 블로그 링크 추출 (Playwright용 헬퍼)"""
     anchors = page.locator(
         "a[href*='blog.naver.com'], a[href*='post.naver.com'], "
         "a[href*='m.blog.naver.com']"
     ).all()
-
     for a in anchors:
         try:
             href = a.get_attribute("href") or ""
             if not href or href in seen_urls:
                 continue
-            # 이미지·사진 링크 제외
             if any(x in href for x in ["PostList", "photo", "media"]):
                 continue
             seen_urls.add(href)
-
-            # 제목: 인근 텍스트 우선, 없으면 링크 텍스트
-            title = ""
             try:
-                # 부모 컨테이너에서 제목 텍스트 찾기
-                parent = a.locator("xpath=../..")
-                title_el = parent.locator("strong, span.title, p.title, em").first
-                title = title_el.inner_text().strip()[:120]
+                title = a.inner_text().strip()[:120]
             except Exception:
-                pass
-            if not title:
-                try:
-                    title = a.inner_text().strip()[:120]
-                except Exception:
-                    title = ""
-
+                title = ""
             links.append({"url": href, "title": title, "excerpt": ""})
         except Exception:
             continue
@@ -642,8 +714,25 @@ def crawl_merchant(job_id: str, merchant: Dict):
     }
 
     def upd(pct, msg):
-        CRAWL_JOBS[job_id].update({"status":"running","progress":pct,"message":msg})
+        job = CRAWL_JOBS.get(job_id, {})
+        job.update({"status": "running", "progress": pct, "message": msg})
+        CRAWL_JOBS[job_id] = job
+        save_job(job)
         print(f"[{pct}%] {msg}")
+
+    # ── 하트비트: 30초마다 현재 상태를 파일에 기록 (watchdog) ──
+    import threading
+    _stop_hb = threading.Event()
+    def _heartbeat():
+        while not _stop_hb.is_set():
+            _stop_hb.wait(30)
+            if not _stop_hb.is_set():
+                job = CRAWL_JOBS.get(job_id, {})
+                if job.get("status") == "running":
+                    save_job(job)
+                    print(f"[HB] job={job_id} {job.get('progress')}% alive")
+    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+    hb_thread.start()
 
     try:
         # 0. 공식 수치 파싱
@@ -658,18 +747,21 @@ def crawl_merchant(job_id: str, merchant: Dict):
         result["naver_receipt_reviews"] = receipt
         upd(40, f"영수증리뷰 {len(receipt)}건 수집 완료")
 
-        # 2. 블로그 리뷰 목록 수집 (43~58% 구간 — 클릭마다 갱신)
+        # 2. 블로그 리뷰 목록 수집 (43~56% 구간)
         official_b = counts.get("blog_total", 0)
-        blog_target = min(official_b or 30, 30)   # 최대 30건으로 제한
+        blog_target = min(official_b or 30, 30)
 
         def blog_list_progress(current, total):
-            # 43% ~ 56% 구간
             pct = 43 + int((min(current, total) / max(total, 1)) * 13)
             upd(pct, f"블로그리뷰 목록 수집 중... ({current}건 / 목표 {total}건)")
 
-        upd(43, f"블로그리뷰 목록 수집 중... (공식 {official_b}건, 최대 {blog_target}건 수집)")
-        blog_links = crawl_blog_links(place_id, target=blog_target,
-                                       progress_cb=blog_list_progress)
+        upd(43, f"블로그리뷰 목록 수집 중... (공식 {official_b}건, 최대 {blog_target}건)")
+        blog_links = crawl_blog_links(
+            place_id=place_id,
+            merchant_name=name,        # ← 가맹점명 전달 (검색 쿼리용)
+            target=blog_target,
+            progress_cb=blog_list_progress,
+        )
         upd(57, f"블로그 링크 {len(blog_links)}건 확보, 원문 방문 시작...")
 
         # 3. 블로그 원문 방문 → 광고 판별 (57~75% 구간 — 건별 갱신)
@@ -694,7 +786,11 @@ def crawl_merchant(job_id: str, merchant: Dict):
         upd(97, f"인스타그램 {ig_cnt}건")
 
     except Exception as e:
-        CRAWL_JOBS[job_id].update({"status":"error","message":f"오류: {str(e)}"})
+        _stop_hb.set()
+        job = CRAWL_JOBS.get(job_id, {})
+        job.update({"status": "error", "message": f"오류: {str(e)}"})
+        CRAWL_JOBS[job_id] = job
+        save_job(job)
         print(f"[ERROR job={job_id}] {e}")
         return
 
@@ -703,29 +799,33 @@ def crawl_merchant(job_id: str, merchant: Dict):
     blog_list    = result["naver_blog_reviews"]
 
     result["summary"] = {
-        # 공식 수치 (플레이스 화면 기준)
         "official_receipt_count": result["place_counts"].get("receipt_total", 0),
         "official_blog_count":    result["place_counts"].get("blog_total", 0),
-        # 실제 수집 수
         "total_receipt_reviews":  len(receipt_list),
         "total_blog_reviews":     len(blog_list),
         "naver_search_count":     naver_cnt,
         "instagram_count":        ig_cnt,
-        # 블로그 광고 판별
         "blog_ad_count":      sum(1 for r in blog_list if r["ad_type"]=="광고"),
         "blog_organic_count": sum(1 for r in blog_list if r["ad_type"]=="내돈내산"),
         "blog_unknown_count": sum(1 for r in blog_list if r["ad_type"]=="판별불가"),
-        # 영수증 광고 판별
         "receipt_ad_count":      sum(1 for r in receipt_list if r["ad_type"]=="광고"),
         "receipt_organic_count": sum(1 for r in receipt_list if r["ad_type"]=="내돈내산"),
         "receipt_unknown_count": sum(1 for r in receipt_list if r["ad_type"]=="판별불가"),
     }
 
+    # 하트비트 종료
+    _stop_hb.set()
+
+    # 리포트 파일 저장
     REPORTS[merchant["id"]] = result
-    CRAWL_JOBS[job_id].update({
-        "status":"done","progress":100,
-        "message":"분석 완료","report_id":merchant["id"]
-    })
+    save_report(merchant["id"], result)
+
+    # job 완료 파일 저장
+    done_job = {**CRAWL_JOBS.get(job_id, {}),
+                "status": "done", "progress": 100,
+                "message": "분석 완료", "report_id": merchant["id"]}
+    CRAWL_JOBS[job_id] = done_job
+    save_job(done_job)
     print(f"[DONE] {name} / 영수증:{len(receipt_list)} 블로그:{len(blog_list)}")
 
 
@@ -751,6 +851,7 @@ async def add_merchant(data: MerchantCreate):
         "created_at": datetime.now().isoformat()
     }
     MERCHANTS.append(m)
+    save_merchants()   # ← 파일 저장
     return m
 
 @app.put("/api/merchants/{mid}")
@@ -758,16 +859,18 @@ async def update_merchant(mid: str, data: MerchantUpdate):
     m = next((m for m in MERCHANTS if m["id"] == mid), None)
     if not m:
         raise HTTPException(404, "가맹점 없음")
-    for f in ["name","region","place_id","instagram_tag"]:
+    for f in ["name", "region", "place_id", "instagram_tag"]:
         v = getattr(data, f)
         if v is not None:
             m[f] = v
+    save_merchants()
     return m
 
 @app.delete("/api/merchants/{mid}")
 async def delete_merchant(mid: str):
     global MERCHANTS
     MERCHANTS = [m for m in MERCHANTS if m["id"] != mid]
+    save_merchants()
     return {"deleted": mid}
 
 @app.post("/api/crawl")
@@ -776,7 +879,7 @@ async def start_crawl(req: CrawlRequest):
     if not merchant:
         raise HTTPException(404, "가맹점 없음")
     job_id = str(uuid.uuid4())
-    CRAWL_JOBS[job_id] = {
+    job = {
         "id": job_id,
         "merchant_id": req.merchant_id,
         "merchant_name": merchant["name"],
@@ -785,27 +888,36 @@ async def start_crawl(req: CrawlRequest):
         "message": "분석 대기 중...",
         "started_at": datetime.now().isoformat()
     }
+    # ── 파일 먼저 저장 → 응답 → executor 실행 순서 보장 ──
+    CRAWL_JOBS[job_id] = job
+    save_job(job)                           # 폴링 전에 반드시 파일 존재해야 함
     executor.submit(crawl_merchant, job_id, merchant)
     return {"job_id": job_id}
 
 @app.get("/api/crawl-jobs/{job_id}")
 async def get_job(job_id: str):
-    j = CRAWL_JOBS.get(job_id)
+    j = load_job(job_id)   # ← 메모리 없으면 파일에서 복원
     if not j:
         raise HTTPException(404, "작업 없음")
     return j
 
 @app.get("/api/reports/{mid}")
 async def get_report(mid: str):
-    r = REPORTS.get(mid)
+    r = load_report(mid)   # ← 메모리 없으면 파일에서 복원
     if not r:
         raise HTTPException(404, "리포트 없음. 분석을 먼저 실행하세요.")
     return r
 
 @app.get("/api/health")
 async def health():
-    return {"status":"ok","playwright":PLAYWRIGHT_AVAILABLE,
-            "merchants":len(MERCHANTS),"reports":len(REPORTS)}
+    return {
+        "status": "ok",
+        "playwright": PLAYWRIGHT_AVAILABLE,
+        "merchants": len(MERCHANTS),
+        "jobs_in_memory": len(CRAWL_JOBS),
+        "reports_in_memory": len(REPORTS),
+        "data_dir": str(DATA_DIR),
+    }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
