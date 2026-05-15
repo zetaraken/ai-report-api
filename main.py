@@ -217,239 +217,435 @@ def get_official_counts(place_id: str) -> Dict:
 
 
 # ════════════════════════════════════════════════════════════
-# STEP 1: 영수증(방문자) 리뷰 — Playwright 스크롤+더보기 반복
+# STEP 1: 영수증(방문자) 리뷰
+# 네이버 플레이스는 GraphQL API로 리뷰 데이터를 가져옴
+# graphql 엔드포인트를 가로채고 → requests로 페이지네이션
 # ════════════════════════════════════════════════════════════
-def crawl_receipt_reviews(place_id: str, target: int = 250) -> List[Dict]:
-    """
-    네이버 플레이스 방문자(영수증) 리뷰 수집
-    - 버튼명: '펼쳐서 더보기' (네이버 플레이스 실제 버튼명)
-    - 각 리뷰 카드의 '펼쳐서 더보기' 클릭 → 전체 텍스트 로드
-    - 페이지 스크롤로 다음 리뷰 로드
-    """
+def crawl_receipt_reviews(place_id: str, target: int = 300) -> List[Dict]:
     reviews = []
     seen_texts = set()
+    graphql_calls = []   # GraphQL 요청 정보 저장
 
+    # ── 1차: Playwright로 GraphQL 요청 가로채기 ───────────────
     try:
         with sync_playwright() as p:
             browser, ctx = make_browser(p, mobile=True)
             page = ctx.new_page()
 
+            def on_response(response):
+                url = response.url
+                # graphql 엔드포인트 포함 모든 JSON 응답 캡처
+                if "graphql" in url or any(k in url for k in [
+                    "visitorReview", "visitor", "review", "ugc"
+                ]):
+                    try:
+                        ct = response.headers.get("content-type", "")
+                        if "json" in ct:
+                            data = response.json()
+                            body = None
+                            try:
+                                body = response.request.post_data
+                            except Exception:
+                                pass
+                            graphql_calls.append({
+                                "url": url,
+                                "headers": dict(response.request.headers),
+                                "body": body,
+                                "data": data,
+                                "method": response.request.method,
+                            })
+                            print(f"[가로채기] {response.request.method} {url[:80]}")
+                    except Exception:
+                        pass
+
+            page.on("response", on_response)
+            page.goto(
+                f"https://m.place.naver.com/restaurant/{place_id}/review/visitor",
+                wait_until="networkidle", timeout=30000
+            )
+            page.wait_for_timeout(3000)
+
+            # 스크롤로 다음 페이지 GraphQL 트리거
+            for _ in range(3):
+                page.evaluate("window.scrollBy(0, 800)")
+                page.wait_for_timeout(1200)
+
+            browser.close()
+    except Exception as e:
+        print(f"[영수증 GraphQL 가로채기 오류] {e}")
+
+    print(f"[영수증] GraphQL 요청 {len(graphql_calls)}개 가로챔")
+
+    # ── 2차: 가로챈 데이터에서 즉시 추출 ──────────────────────
+    for call in graphql_calls:
+        _extract_review_texts(call["data"], reviews, seen_texts)
+
+    print(f"[영수증] 가로채기로 {len(reviews)}건 추출")
+
+    # ── 3차: GraphQL POST 재호출로 페이지네이션 ───────────────
+    if graphql_calls and len(reviews) < target:
+        import requests as req_lib
+
+        # GraphQL POST 요청 찾기
+        gql_post = next(
+            (c for c in graphql_calls
+             if c["method"] == "POST" and "graphql" in c["url"]),
+            None
+        )
+
+        if gql_post:
+            print(f"[영수증] GraphQL POST 재호출로 페이지네이션 시작")
+            try:
+                body_str = gql_post["body"] or ""
+                body_json = json.loads(body_str) if body_str else {}
+
+                # 페이지 변수 찾기 (page, after, cursor, offset 등)
+                variables = body_json.get("variables", {})
+                page_key = None
+                for k in ["page", "after", "cursor", "offset", "start"]:
+                    if k in variables:
+                        page_key = k
+                        break
+
+                if page_key:
+                    current_val = variables[page_key]
+                    next_val = (current_val + 1) if isinstance(current_val, int) else None
+
+                    while next_val and len(reviews) < target:
+                        try:
+                            variables[page_key] = next_val
+                            body_json["variables"] = variables
+                            r = req_lib.post(
+                                gql_post["url"],
+                                json=body_json,
+                                headers=gql_post["headers"],
+                                timeout=10
+                            )
+                            if r.status_code != 200:
+                                break
+                            data = r.json()
+                            prev = len(reviews)
+                            _extract_review_texts(data, reviews, seen_texts)
+                            if len(reviews) == prev:
+                                break
+                            next_val += 1
+                            print(f"[영수증] 페이지 {next_val}: 누적 {len(reviews)}건")
+                        except Exception as e:
+                            print(f"[영수증 GraphQL page={next_val}] {e}")
+                            break
+                else:
+                    # variables에 page 키가 없으면 GET 파라미터 방식 시도
+                    _paginate_get_api(graphql_calls, reviews, seen_texts, target)
+
+            except Exception as e:
+                print(f"[영수증 GraphQL POST 오류] {e}")
+                _paginate_get_api(graphql_calls, reviews, seen_texts, target)
+        else:
+            # POST 없으면 GET 파라미터 방식
+            _paginate_get_api(graphql_calls, reviews, seen_texts, target)
+
+    # ── 4차: 여전히 부족하면 Playwright 스크롤 폴백 ──────────
+    if len(reviews) < 5:
+        print(f"[영수증] GraphQL 수집 부족({len(reviews)}건) → Playwright 스크롤 폴백")
+        reviews = _crawl_receipt_playwright_scroll(place_id, target, seen_texts)
+
+    print(f"[영수증] 최종 수집: {len(reviews)}건")
+    return reviews
+
+
+def _paginate_get_api(api_calls: list, reviews: list,
+                       seen_texts: set, target: int):
+    """GET 파라미터 방식 페이지네이션"""
+    import requests as req_lib
+    for call in api_calls:
+        if call["method"] != "GET":
+            continue
+        url = call["url"]
+        for pat in [r'(page=)(\d+)', r'(start=)(\d+)']:
+            m = re.search(pat, url)
+            if m:
+                page_num = int(m.group(2)) + 1
+                while len(reviews) < target:
+                    try:
+                        next_url = re.sub(
+                            pat, lambda x, n=page_num: x.group(1) + str(n), url
+                        )
+                        r = req_lib.get(next_url, headers=call["headers"], timeout=10)
+                        if r.status_code != 200:
+                            break
+                        data = r.json()
+                        prev = len(reviews)
+                        _extract_review_texts(data, reviews, seen_texts)
+                        if len(reviews) == prev:
+                            break
+                        page_num += 1
+                        print(f"[영수증 GET] 페이지 {page_num}: 누적 {len(reviews)}건")
+                    except Exception as e:
+                        print(f"[영수증 GET page={page_num}] {e}")
+                        break
+                return
+
+
+def _extract_review_texts(data, reviews: list, seen_texts: set):
+    """JSON 응답에서 리뷰 텍스트 재귀 추출"""
+    if isinstance(data, dict):
+        # 리뷰 텍스트 필드
+        for key in ["body", "content", "text", "description", "contents"]:
+            val = data.get(key, "")
+            if isinstance(val, str) and len(val) >= 10 and val not in seen_texts:
+                # UI 버튼 텍스트 필터
+                if not any(t in val for t in ("펼쳐서 더보기", "반응 남기기", "신고")):
+                    seen_texts.add(val)
+                    ad_type = classify_ad(val)
+                    reviews.append({
+                        "text": val[:500],
+                        "ad_type": ad_type,
+                        "ad_basis": get_basis(val, ad_type),
+                        "source": "naver_receipt",
+                        "rating": data.get("rating", data.get("score", "")),
+                    })
+        for v in data.values():
+            if isinstance(v, (dict, list)):
+                _extract_review_texts(v, reviews, seen_texts)
+    elif isinstance(data, list):
+        for item in data:
+            _extract_review_texts(item, reviews, seen_texts)
+
+
+def _crawl_receipt_playwright_scroll(place_id: str, target: int,
+                                      seen_texts: set) -> list:
+    """Playwright 전체 스크롤 폴백 — 리뷰 li 요소 직접 수집"""
+    reviews = []
+    try:
+        with sync_playwright() as p:
+            browser, ctx = make_browser(p, mobile=True)
+            page = ctx.new_page()
             page.goto(
                 f"https://m.place.naver.com/restaurant/{place_id}/review/visitor",
                 wait_until="domcontentloaded", timeout=30000
             )
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(3000)
 
-            scroll_count = 0
-            max_scrolls = 200   # 스크롤 최대 횟수 (리뷰 수 충분히 커버)
-            no_new_count = 0
+            no_new = 0
+            for i in range(300):  # 최대 300회 스크롤
+                prev = len(reviews)
 
-            while scroll_count < max_scrolls:
-                prev_count = len(reviews)
-
-                # ── 1. '펼쳐서 더보기' 버튼 모두 클릭 (접힌 리뷰 펼치기) ──
-                expand_btns = page.locator(
-                    "button:has-text('펼쳐서 더보기'), "
-                    "a:has-text('펼쳐서 더보기'), "
-                    "span:has-text('펼쳐서 더보기')"
-                ).all()
-                for btn in expand_btns:
+                # 펼쳐서 더보기 버튼 전부 클릭
+                for btn in page.locator("button:has-text('펼쳐서 더보기')").all():
                     try:
-                        if btn.is_visible(timeout=500):
-                            btn.click()
-                            page.wait_for_timeout(300)
+                        btn.scroll_into_view_if_needed()
+                        btn.click()
+                        page.wait_for_timeout(200)
+                    except Exception:
+                        pass
+
+                # 리뷰 텍스트 수집 (여러 셀렉터 시도)
+                for sel in [
+                    "li.pui__X35jYm span.pui__Ic-pg",
+                    "li[data-laim-exp-id] span",
+                    ".pui__vn15t2",
+                    "li.pui__X35jYm",
+                    "[class*='ReviewItem'] p",
+                    "[class*='review_item'] span",
+                ]:
+                    try:
+                        els = page.locator(sel).all()
+                        for el in els:
+                            try:
+                                text = el.inner_text().strip()
+                                if (len(text) >= 10
+                                        and text not in seen_texts
+                                        and "펼쳐서 더보기" not in text
+                                        and "반응 남기기" not in text):
+                                    seen_texts.add(text)
+                                    ad_type = classify_ad(text)
+                                    reviews.append({
+                                        "text": text[:500],
+                                        "ad_type": ad_type,
+                                        "ad_basis": get_basis(text, ad_type),
+                                        "source": "naver_receipt",
+                                    })
+                            except Exception:
+                                continue
                     except Exception:
                         continue
-
-                # ── 2. 현재 로드된 리뷰 텍스트 수집 ──────────────
-                _collect_receipt_texts(page, reviews, seen_texts)
 
                 if len(reviews) >= target:
                     break
 
-                # ── 3. 스크롤 다운으로 다음 리뷰 로드 ────────────
-                page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-                page.wait_for_timeout(1000)
-                scroll_count += 1
+                page.evaluate("window.scrollBy(0, 800)")
+                page.wait_for_timeout(800)
 
-                # 새 리뷰가 없으면 카운트
-                if len(reviews) == prev_count:
-                    no_new_count += 1
-                    if no_new_count >= 5:
-                        print(f"[영수증] 스크롤 {scroll_count}회 후 새 리뷰 없음. 종료.")
+                if len(reviews) == prev:
+                    no_new += 1
+                    if no_new >= 8:
                         break
                 else:
-                    no_new_count = 0
+                    no_new = 0
 
-            # 마지막 펼치기 + 수집
-            expand_btns = page.locator(
-                "button:has-text('펼쳐서 더보기'), "
-                "a:has-text('펼쳐서 더보기')"
-            ).all()
-            for btn in expand_btns:
-                try:
-                    btn.click()
-                    page.wait_for_timeout(200)
-                except Exception:
-                    continue
-            _collect_receipt_texts(page, reviews, seen_texts)
             browser.close()
-
     except Exception as e:
-        print(f"[영수증 크롤링 오류] {e}")
-
-    print(f"[영수증] 최종 수집: {len(reviews)}건")
+        print(f"[영수증 스크롤 폴백 오류] {e}")
     return reviews
 
 
 def _collect_receipt_texts(page, reviews: list, seen_texts: set):
     """현재 페이지에서 리뷰 텍스트 추출 (중복 제외, 텍스트 있는 것만)"""
     selectors = [
+        "li.pui__X35jYm span.pui__Ic-pg",
         "li.pui__X35jYm",
-        "div.place_section_content li",
-        "li[class*='ReviewItem']",
-        "div[class*='ReviewItem']",
         "li[data-laim-exp-id]",
         ".pui__vn15t2",
+        "div[class*='ReviewItem']",
         "div[class*='review_item']",
     ]
-
-    collected = []
     for sel in selectors:
         try:
             els = page.locator(sel).all()
             if len(els) >= 2:
-                collected = els
+                for el in els:
+                    try:
+                        text = el.inner_text().strip()
+                        if (len(text) >= 10
+                                and text not in seen_texts
+                                and "펼쳐서 더보기" not in text
+                                and "반응 남기기" not in text):
+                            seen_texts.add(text)
+                            ad_type = classify_ad(text)
+                            reviews.append({
+                                "text": text[:500],
+                                "ad_type": ad_type,
+                                "ad_basis": get_basis(text, ad_type),
+                                "source": "naver_receipt",
+                            })
+                    except Exception:
+                        continue
                 break
         except Exception:
             continue
 
-    if not collected:
-        try:
-            collected = page.locator("span.pui__Ic-pg, p.pui__xtsQN").all()
-        except Exception:
-            pass
-
-    for el in collected:
-        try:
-            text = el.inner_text().strip()
-            if len(text) < 10:
-                continue
-            # UI 버튼 텍스트 필터링
-            if any(t in text for t in ("펼쳐서 더보기", "접기", "좋아요", "신고", "사진보기", "반응 남기기")):
-                continue
-            if text in seen_texts:
-                continue
-            seen_texts.add(text)
-            ad_type = classify_ad(text)
-            reviews.append({
-                "text": text[:500],
-                "ad_type": ad_type,
-                "ad_basis": get_basis(text, ad_type),
-                "source": "naver_receipt",
-            })
-        except Exception:
-            continue
-
 
 # ════════════════════════════════════════════════════════════
-# STEP 2: 블로그 리뷰 목록 수집
-# 버튼명: '펼쳐서 더보기' (네이버 플레이스 실제 버튼명)
-# 블로그 카드 구조: 제목+링크+미리보기 텍스트
+# STEP 2: 블로그 리뷰 목록 수집 — GraphQL 가로채기
 # ════════════════════════════════════════════════════════════
 def crawl_blog_links(place_id: str, merchant_name: str = "",
-                     target: int = 77, progress_cb=None) -> List[Dict]:
-    """
-    네이버 플레이스 블로그리뷰 탭에서 직접 수집
-    - 스크롤로 카드 로드 → '펼쳐서 더보기' 클릭 → 링크 추출
-    - 네트워크 응답 JSON 가로채기 병행
-    """
+                     target: int = 100, progress_cb=None) -> List[Dict]:
     links = []
     seen_urls = set()
-    captured_responses = []
+    graphql_calls = []
 
+    # ── 1차: Playwright로 GraphQL 요청 가로채기 ───────────────
     try:
         with sync_playwright() as p:
             browser, ctx = make_browser(p, mobile=True)
             page = ctx.new_page()
 
-            # 네트워크 JSON 응답 가로채기
             def on_response(response):
                 url = response.url
-                if any(kw in url for kw in ["ugc", "blog", "review", "graphql"]):
+                if "graphql" in url or any(k in url for k in ["ugc", "blog", "review"]):
                     try:
-                        if "json" in response.headers.get("content-type", ""):
-                            captured_responses.append(response.json())
+                        ct = response.headers.get("content-type", "")
+                        if "json" in ct:
+                            data = response.json()
+                            body = None
+                            try:
+                                body = response.request.post_data
+                            except Exception:
+                                pass
+                            graphql_calls.append({
+                                "url": url,
+                                "headers": dict(response.request.headers),
+                                "body": body,
+                                "data": data,
+                                "method": response.request.method,
+                            })
+                            _extract_links_from_json(data, links, seen_urls)
+                            print(f"[블로그 가로채기] {url[:80]} → {len(links)}건")
                     except Exception:
                         pass
-            page.on("response", on_response)
 
+            page.on("response", on_response)
             page.goto(
                 f"https://m.place.naver.com/restaurant/{place_id}/review/ugc",
                 wait_until="networkidle", timeout=25000
             )
             page.wait_for_timeout(2000)
 
-            scroll_count = 0
-            max_scrolls = 50
-            no_new_count = 0
+            if progress_cb:
+                progress_cb(len(links), target)
 
-            while scroll_count < max_scrolls:
-                prev = len(links)
-
-                # 캡처된 API JSON에서 링크 추출
-                for resp in captured_responses:
-                    _extract_links_from_json(resp, links, seen_urls)
-
-                # DOM에서 블로그 카드 링크 추출
-                _collect_blog_links(page, links, seen_urls)
-
+            # 스크롤로 추가 GraphQL 트리거
+            for _ in range(5):
+                if len(links) >= target:
+                    break
+                page.evaluate("window.scrollBy(0, 800)")
+                page.wait_for_timeout(1000)
+                for call in graphql_calls:
+                    _extract_links_from_json(call["data"], links, seen_urls)
                 if progress_cb:
                     progress_cb(len(links), target)
 
-                if len(links) >= target:
-                    break
-
-                # '펼쳐서 더보기' 버튼 클릭 (미리보기 → 전체 카드 확장)
-                expand_btns = page.locator(
-                    "button:has-text('펼쳐서 더보기'), "
-                    "a:has-text('펼쳐서 더보기'), "
-                    "span:has-text('펼쳐서 더보기')"
-                ).all()
-                for btn in expand_btns:
-                    try:
-                        if btn.is_visible(timeout=400):
-                            btn.click()
-                            page.wait_for_timeout(300)
-                    except Exception:
-                        continue
-
-                # 스크롤 다운
-                page.evaluate("window.scrollBy(0, window.innerHeight * 2)")
-                page.wait_for_timeout(1200)
-                scroll_count += 1
-
-                if len(links) == prev:
-                    no_new_count += 1
-                    if no_new_count >= 5:
-                        print(f"[블로그] 스크롤 {scroll_count}회 후 새 링크 없음. 종료.")
-                        break
-                else:
-                    no_new_count = 0
-
-            # 마지막 수집
-            for resp in captured_responses:
-                _extract_links_from_json(resp, links, seen_urls)
             _collect_blog_links(page, links, seen_urls)
             browser.close()
-
     except Exception as e:
-        print(f"[블로그 목록 오류] {e}")
+        print(f"[블로그 GraphQL 가로채기 오류] {e}")
 
-    # 폴백: 플레이스 탭에서 0건이면 네이버 블로그 검색
-    if not links and merchant_name:
-        print("[블로그] 플레이스 탭 수집 실패 → 네이버 블로그 검색 폴백")
-        links = _crawl_blog_links_via_search(merchant_name, target, set())
+    print(f"[블로그] 가로채기로 {len(links)}건 추출")
+
+    # ── 2차: GraphQL POST 재호출로 페이지네이션 ───────────────
+    if graphql_calls and len(links) < target:
+        import requests as req_lib
+
+        gql_post = next(
+            (c for c in graphql_calls
+             if c["method"] == "POST" and "graphql" in c["url"]),
+            None
+        )
+
+        if gql_post:
+            try:
+                body_str = gql_post["body"] or ""
+                body_json = json.loads(body_str) if body_str else {}
+                variables = body_json.get("variables", {})
+                page_key = next(
+                    (k for k in ["page", "after", "cursor", "offset", "start"]
+                     if k in variables), None
+                )
+                if page_key:
+                    current_val = variables[page_key]
+                    next_val = (current_val + 1) if isinstance(current_val, int) else None
+                    while next_val and len(links) < target:
+                        try:
+                            variables[page_key] = next_val
+                            body_json["variables"] = variables
+                            r = req_lib.post(
+                                gql_post["url"],
+                                json=body_json,
+                                headers=gql_post["headers"],
+                                timeout=10
+                            )
+                            if r.status_code != 200:
+                                break
+                            data = r.json()
+                            prev = len(links)
+                            _extract_links_from_json(data, links, seen_urls)
+                            if len(links) == prev:
+                                break
+                            next_val += 1
+                            if progress_cb:
+                                progress_cb(len(links), target)
+                            print(f"[블로그] 페이지 {next_val}: 누적 {len(links)}건")
+                        except Exception as e:
+                            print(f"[블로그 GraphQL page={next_val}] {e}")
+                            break
+            except Exception as e:
+                print(f"[블로그 GraphQL POST 오류] {e}")
+
+    # ── 3차: 부족 시 네이버 블로그 검색 폴백 ──────────────────
+    if len(links) < 5 and merchant_name:
+        print("[블로그] 수집 부족 → 네이버 블로그 검색 폴백")
+        extra = _crawl_blog_links_via_search(merchant_name, target - len(links), seen_urls)
+        links.extend(extra)
 
     if progress_cb:
         progress_cb(len(links), target)
