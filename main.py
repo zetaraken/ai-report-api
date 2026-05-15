@@ -218,135 +218,155 @@ def get_official_counts(place_id: str) -> Dict:
 
 # ════════════════════════════════════════════════════════════
 # STEP 1: 영수증(방문자) 리뷰
-# 네이버 플레이스는 GraphQL API로 리뷰 데이터를 가져옴
-# graphql 엔드포인트를 가로채고 → requests로 페이지네이션
+# page.route()로 GraphQL POST body까지 정확히 가로채기
 # ════════════════════════════════════════════════════════════
 def crawl_receipt_reviews(place_id: str, target: int = 300) -> List[Dict]:
     reviews = []
     seen_texts = set()
-    graphql_calls = []   # GraphQL 요청 정보 저장
+    graphql_calls = []
 
-    # ── 1차: Playwright로 GraphQL 요청 가로채기 ───────────────
     try:
         with sync_playwright() as p:
             browser, ctx = make_browser(p, mobile=True)
             page = ctx.new_page()
 
+            # ── page.route()로 GraphQL 요청 가로채기 (body 포함) ──
+            def handle_route(route):
+                req = route.request
+                url = req.url
+                if "graphql" in url or any(k in url for k in [
+                    "visitorReview", "visitor", "ugcReview", "ugc"
+                ]):
+                    try:
+                        post_data = req.post_data or ""
+                        # 요청 계속 진행
+                        route.continue_()
+                        # 응답은 on_response에서 처리
+                        graphql_calls.append({
+                            "url": url,
+                            "headers": dict(req.headers),
+                            "body": post_data,
+                            "method": req.method,
+                            "data": None,  # 응답은 나중에 채움
+                        })
+                        print(f"[route] {req.method} {url[:80]} body={post_data[:100]}")
+                    except Exception as e:
+                        print(f"[route 오류] {e}")
+                        route.continue_()
+                else:
+                    route.continue_()
+
+            page.route("**/*", handle_route)
+
+            # 응답 데이터도 별도로 수집
+            responses = {}
             def on_response(response):
                 url = response.url
-                # graphql 엔드포인트 포함 모든 JSON 응답 캡처
                 if "graphql" in url or any(k in url for k in [
-                    "visitorReview", "visitor", "review", "ugc"
+                    "visitorReview", "visitor", "ugcReview", "ugc"
                 ]):
                     try:
                         ct = response.headers.get("content-type", "")
                         if "json" in ct:
                             data = response.json()
-                            body = None
-                            try:
-                                body = response.request.post_data
-                            except Exception:
-                                pass
-                            graphql_calls.append({
-                                "url": url,
-                                "headers": dict(response.request.headers),
-                                "body": body,
-                                "data": data,
-                                "method": response.request.method,
-                            })
-                            print(f"[가로채기] {response.request.method} {url[:80]}")
+                            responses[url] = data
+                            # 즉시 텍스트 추출
+                            _extract_review_texts(data, reviews, seen_texts)
                     except Exception:
                         pass
 
             page.on("response", on_response)
+
             page.goto(
                 f"https://m.place.naver.com/restaurant/{place_id}/review/visitor",
                 wait_until="networkidle", timeout=30000
             )
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(2000)
 
-            # 스크롤로 다음 페이지 GraphQL 트리거
-            for _ in range(3):
+            # 스크롤로 2~3페이지 트리거
+            for _ in range(4):
                 page.evaluate("window.scrollBy(0, 800)")
-                page.wait_for_timeout(1200)
+                page.wait_for_timeout(1000)
+
+            # 가로챈 요청에 응답 데이터 매핑
+            for call in graphql_calls:
+                if call["url"] in responses:
+                    call["data"] = responses[call["url"]]
 
             browser.close()
+
     except Exception as e:
-        print(f"[영수증 GraphQL 가로채기 오류] {e}")
+        print(f"[영수증 route 가로채기 오류] {e}")
 
-    print(f"[영수증] GraphQL 요청 {len(graphql_calls)}개 가로챔")
+    print(f"[영수증] route 가로채기: {len(graphql_calls)}개 요청, {len(reviews)}건 추출")
 
-    # ── 2차: 가로챈 데이터에서 즉시 추출 ──────────────────────
-    for call in graphql_calls:
-        _extract_review_texts(call["data"], reviews, seen_texts)
-
-    print(f"[영수증] 가로채기로 {len(reviews)}건 추출")
-
-    # ── 3차: GraphQL POST 재호출로 페이지네이션 ───────────────
-    if graphql_calls and len(reviews) < target:
+    # ── GraphQL POST body로 페이지네이션 ───────────────────────
+    if len(reviews) < target:
         import requests as req_lib
 
-        # GraphQL POST 요청 찾기
-        gql_post = next(
-            (c for c in graphql_calls
-             if c["method"] == "POST" and "graphql" in c["url"]),
-            None
-        )
+        # POST body가 있는 GraphQL 요청 찾기
+        gql_posts = [c for c in graphql_calls
+                     if c["method"] == "POST" and "graphql" in c["url"] and c["body"]]
 
-        if gql_post:
-            print(f"[영수증] GraphQL POST 재호출로 페이지네이션 시작")
+        for gql in gql_posts:
             try:
-                body_str = gql_post["body"] or ""
-                body_json = json.loads(body_str) if body_str else {}
-
-                # 페이지 변수 찾기 (page, after, cursor, offset 등)
+                body_json = json.loads(gql["body"])
                 variables = body_json.get("variables", {})
-                page_key = None
-                for k in ["page", "after", "cursor", "offset", "start"]:
-                    if k in variables:
-                        page_key = k
+
+                # 페이지 키 탐색
+                page_key = next(
+                    (k for k in ["page", "after", "cursor", "offset", "start"]
+                     if k in variables), None
+                )
+
+                if not page_key:
+                    print(f"[영수증] variables 키 없음: {list(variables.keys())}")
+                    continue
+
+                current_val = variables[page_key]
+                print(f"[영수증] 페이지네이션 시작: {page_key}={current_val}")
+
+                next_val = (current_val + 1) if isinstance(current_val, int) else 2
+
+                while len(reviews) < target:
+                    try:
+                        variables[page_key] = next_val
+                        body_json["variables"] = variables
+                        r = req_lib.post(
+                            gql["url"],
+                            json=body_json,
+                            headers=gql["headers"],
+                            timeout=12
+                        )
+                        if r.status_code != 200:
+                            print(f"[영수증] 페이지 {next_val} → HTTP {r.status_code}")
+                            break
+                        data = r.json()
+                        prev = len(reviews)
+                        _extract_review_texts(data, reviews, seen_texts)
+                        if len(reviews) == prev:
+                            print(f"[영수증] 페이지 {next_val}: 새 리뷰 없음. 종료.")
+                            break
+                        print(f"[영수증] 페이지 {next_val}: 누적 {len(reviews)}건")
+                        next_val += 1
+                    except Exception as e:
+                        print(f"[영수증] 페이지 {next_val} 오류: {e}")
                         break
 
-                if page_key:
-                    current_val = variables[page_key]
-                    next_val = (current_val + 1) if isinstance(current_val, int) else None
-
-                    while next_val and len(reviews) < target:
-                        try:
-                            variables[page_key] = next_val
-                            body_json["variables"] = variables
-                            r = req_lib.post(
-                                gql_post["url"],
-                                json=body_json,
-                                headers=gql_post["headers"],
-                                timeout=10
-                            )
-                            if r.status_code != 200:
-                                break
-                            data = r.json()
-                            prev = len(reviews)
-                            _extract_review_texts(data, reviews, seen_texts)
-                            if len(reviews) == prev:
-                                break
-                            next_val += 1
-                            print(f"[영수증] 페이지 {next_val}: 누적 {len(reviews)}건")
-                        except Exception as e:
-                            print(f"[영수증 GraphQL page={next_val}] {e}")
-                            break
-                else:
-                    # variables에 page 키가 없으면 GET 파라미터 방식 시도
-                    _paginate_get_api(graphql_calls, reviews, seen_texts, target)
+                if len(reviews) >= target:
+                    break
 
             except Exception as e:
-                print(f"[영수증 GraphQL POST 오류] {e}")
-                _paginate_get_api(graphql_calls, reviews, seen_texts, target)
-        else:
-            # POST 없으면 GET 파라미터 방식
+                print(f"[영수증 페이지네이션 오류] {e}")
+                continue
+
+        # GET 파라미터 방식 폴백
+        if len(reviews) < 10:
             _paginate_get_api(graphql_calls, reviews, seen_texts, target)
 
-    # ── 4차: 여전히 부족하면 Playwright 스크롤 폴백 ──────────
+    # ── Playwright 전체 스크롤 최후 폴백 ──────────────────────
     if len(reviews) < 5:
-        print(f"[영수증] GraphQL 수집 부족({len(reviews)}건) → Playwright 스크롤 폴백")
+        print(f"[영수증] GraphQL 실패({len(reviews)}건) → Playwright 스크롤 폴백")
         reviews = _crawl_receipt_playwright_scroll(place_id, target, seen_texts)
 
     print(f"[영수증] 최종 수집: {len(reviews)}건")
@@ -526,7 +546,7 @@ def _collect_receipt_texts(page, reviews: list, seen_texts: set):
 
 
 # ════════════════════════════════════════════════════════════
-# STEP 2: 블로그 리뷰 목록 수집 — GraphQL 가로채기
+# STEP 2: 블로그 리뷰 목록 수집 — page.route() GraphQL 가로채기
 # ════════════════════════════════════════════════════════════
 def crawl_blog_links(place_id: str, merchant_name: str = "",
                      target: int = 100, progress_cb=None) -> List[Dict]:
@@ -534,12 +554,33 @@ def crawl_blog_links(place_id: str, merchant_name: str = "",
     seen_urls = set()
     graphql_calls = []
 
-    # ── 1차: Playwright로 GraphQL 요청 가로채기 ───────────────
     try:
         with sync_playwright() as p:
             browser, ctx = make_browser(p, mobile=True)
             page = ctx.new_page()
 
+            def handle_route(route):
+                req = route.request
+                url = req.url
+                if "graphql" in url or any(k in url for k in ["ugc", "blog", "review"]):
+                    try:
+                        post_data = req.post_data or ""
+                        route.continue_()
+                        graphql_calls.append({
+                            "url": url,
+                            "headers": dict(req.headers),
+                            "body": post_data,
+                            "method": req.method,
+                            "data": None,
+                        })
+                    except Exception:
+                        route.continue_()
+                else:
+                    route.continue_()
+
+            page.route("**/*", handle_route)
+
+            responses = {}
             def on_response(response):
                 url = response.url
                 if "graphql" in url or any(k in url for k in ["ugc", "blog", "review"]):
@@ -547,24 +588,13 @@ def crawl_blog_links(place_id: str, merchant_name: str = "",
                         ct = response.headers.get("content-type", "")
                         if "json" in ct:
                             data = response.json()
-                            body = None
-                            try:
-                                body = response.request.post_data
-                            except Exception:
-                                pass
-                            graphql_calls.append({
-                                "url": url,
-                                "headers": dict(response.request.headers),
-                                "body": body,
-                                "data": data,
-                                "method": response.request.method,
-                            })
+                            responses[url] = data
                             _extract_links_from_json(data, links, seen_urls)
-                            print(f"[블로그 가로채기] {url[:80]} → {len(links)}건")
                     except Exception:
                         pass
 
             page.on("response", on_response)
+
             page.goto(
                 f"https://m.place.naver.com/restaurant/{place_id}/review/ugc",
                 wait_until="networkidle", timeout=25000
@@ -574,74 +604,80 @@ def crawl_blog_links(place_id: str, merchant_name: str = "",
             if progress_cb:
                 progress_cb(len(links), target)
 
-            # 스크롤로 추가 GraphQL 트리거
-            for _ in range(5):
+            for _ in range(4):
                 if len(links) >= target:
                     break
                 page.evaluate("window.scrollBy(0, 800)")
                 page.wait_for_timeout(1000)
-                for call in graphql_calls:
-                    _extract_links_from_json(call["data"], links, seen_urls)
                 if progress_cb:
                     progress_cb(len(links), target)
 
             _collect_blog_links(page, links, seen_urls)
+
+            for call in graphql_calls:
+                if call["url"] in responses:
+                    call["data"] = responses[call["url"]]
+
             browser.close()
+
     except Exception as e:
-        print(f"[블로그 GraphQL 가로채기 오류] {e}")
+        print(f"[블로그 route 가로채기 오류] {e}")
 
-    print(f"[블로그] 가로채기로 {len(links)}건 추출")
+    print(f"[블로그] route 가로채기: {len(graphql_calls)}개 요청, {len(links)}건 추출")
 
-    # ── 2차: GraphQL POST 재호출로 페이지네이션 ───────────────
-    if graphql_calls and len(links) < target:
+    # ── GraphQL POST 페이지네이션 ──────────────────────────────
+    if len(links) < target:
         import requests as req_lib
 
-        gql_post = next(
-            (c for c in graphql_calls
-             if c["method"] == "POST" and "graphql" in c["url"]),
-            None
-        )
+        gql_posts = [c for c in graphql_calls
+                     if c["method"] == "POST" and "graphql" in c["url"] and c["body"]]
 
-        if gql_post:
+        for gql in gql_posts:
             try:
-                body_str = gql_post["body"] or ""
-                body_json = json.loads(body_str) if body_str else {}
+                body_json = json.loads(gql["body"])
                 variables = body_json.get("variables", {})
                 page_key = next(
                     (k for k in ["page", "after", "cursor", "offset", "start"]
                      if k in variables), None
                 )
-                if page_key:
-                    current_val = variables[page_key]
-                    next_val = (current_val + 1) if isinstance(current_val, int) else None
-                    while next_val and len(links) < target:
-                        try:
-                            variables[page_key] = next_val
-                            body_json["variables"] = variables
-                            r = req_lib.post(
-                                gql_post["url"],
-                                json=body_json,
-                                headers=gql_post["headers"],
-                                timeout=10
-                            )
-                            if r.status_code != 200:
-                                break
-                            data = r.json()
-                            prev = len(links)
-                            _extract_links_from_json(data, links, seen_urls)
-                            if len(links) == prev:
-                                break
-                            next_val += 1
-                            if progress_cb:
-                                progress_cb(len(links), target)
-                            print(f"[블로그] 페이지 {next_val}: 누적 {len(links)}건")
-                        except Exception as e:
-                            print(f"[블로그 GraphQL page={next_val}] {e}")
-                            break
-            except Exception as e:
-                print(f"[블로그 GraphQL POST 오류] {e}")
+                if not page_key:
+                    continue
 
-    # ── 3차: 부족 시 네이버 블로그 검색 폴백 ──────────────────
+                current_val = variables[page_key]
+                next_val = (current_val + 1) if isinstance(current_val, int) else 2
+
+                while len(links) < target:
+                    try:
+                        variables[page_key] = next_val
+                        body_json["variables"] = variables
+                        r = req_lib.post(
+                            gql["url"],
+                            json=body_json,
+                            headers=gql["headers"],
+                            timeout=12
+                        )
+                        if r.status_code != 200:
+                            break
+                        data = r.json()
+                        prev = len(links)
+                        _extract_links_from_json(data, links, seen_urls)
+                        if len(links) == prev:
+                            break
+                        if progress_cb:
+                            progress_cb(len(links), target)
+                        print(f"[블로그] 페이지 {next_val}: 누적 {len(links)}건")
+                        next_val += 1
+                    except Exception as e:
+                        print(f"[블로그] 페이지 {next_val} 오류: {e}")
+                        break
+
+                if len(links) >= target:
+                    break
+
+            except Exception as e:
+                print(f"[블로그 페이지네이션 오류] {e}")
+
+    # ── 폴백: 네이버 블로그 검색 ──────────────────────────────
     if len(links) < 5 and merchant_name:
         print("[블로그] 수집 부족 → 네이버 블로그 검색 폴백")
         extra = _crawl_blog_links_via_search(merchant_name, target - len(links), seen_urls)
