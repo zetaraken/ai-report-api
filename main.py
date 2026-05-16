@@ -1,5 +1,5 @@
 """
-SNS 분석 자동화 솔루션 - 백엔드 API v30
+SNS 분석 자동화 솔루션 - 백엔드 API v31
 영수증리뷰 수집 방식 (영상+버튼 텍스트 확인):
   ① 화면 맨 아래까지 스크롤
   ② "펼쳐서 더보기" 버튼 클릭
@@ -10,6 +10,7 @@ SNS 분석 자동화 솔루션 - 백엔드 API v30
 import json
 import os
 import re
+import time
 import uuid
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -29,7 +30,7 @@ try:
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
-app = FastAPI(title="SNS 분석 솔루션 API", version="30.0.0")
+app = FastAPI(title="SNS 분석 솔루션 API", version="31.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -195,7 +196,7 @@ def get_official_counts(place_id):
                 f"https://pcmap.place.naver.com/restaurant/{place_id}/home",
                 wait_until="domcontentloaded", timeout=30000
             )
-            page.wait_for_timeout(2000)
+            time.sleep(2.0)
             text = page.inner_text("body")
             page.close()
 
@@ -210,7 +211,7 @@ def get_official_counts(place_id):
                 f"https://pcmap.place.naver.com/restaurant/{place_id}/review/visitor",
                 wait_until="domcontentloaded", timeout=30000
             )
-            page2.wait_for_timeout(2000)
+            time.sleep(2.0)
             text2 = page2.inner_text("body")
             page2.close()
 
@@ -321,7 +322,7 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                 page = ctx.new_page()
                 page.set_default_timeout(20000)
                 page.goto(attempt_url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(3000)
+                time.sleep(3.0)
 
                 body_text = page.inner_text("body")
                 print(f"[영수증] 로드 확인: {len(body_text)}자 / {body_text[:80]}")
@@ -346,7 +347,7 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                     for _ in range(4):
                         try:
                             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            page.wait_for_timeout(250)
+                            time.sleep(0.25)
                         except Exception:
                             pass
 
@@ -393,7 +394,7 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                             for _ in range(6):
                                 try:
                                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                                    page.wait_for_timeout(400)
+                                    time.sleep(0.4)
                                 except Exception:
                                     pass
                     else:
@@ -410,7 +411,7 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                         no_btn_streak = 0
                         print(f"[영수증] JS 버튼 클릭 성공 ({clicked_type}) — 라운드 {round_num}")
                         try:
-                            page.wait_for_timeout(1200)
+                            time.sleep(1.2)
                         except Exception:
                             pass
                     else:
@@ -422,7 +423,7 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                         for _ in range(3):
                             try:
                                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                                page.wait_for_timeout(400)
+                                time.sleep(0.4)
                             except Exception:
                                 pass
 
@@ -516,7 +517,7 @@ def crawl_blog_links(place_id, merchant_name="", target=100, progress_cb=None):
             url = f"https://pcmap.place.naver.com/restaurant/{place_id}/review/ugc"
             print(f"[블로그] 접속: {url}")
             page.goto(url, wait_until="domcontentloaded", timeout=25000)
-            page.wait_for_timeout(3000)
+            time.sleep(3.0)
 
             if progress_cb: progress_cb(0, target)
 
@@ -528,7 +529,7 @@ def crawl_blog_links(place_id, merchant_name="", target=100, progress_cb=None):
 
                 for _ in range(6):
                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.wait_for_timeout(400)
+                    time.sleep(0.4)
 
                 _collect_blog_links(page, links, seen_urls)
                 current = len(links)
@@ -550,7 +551,7 @@ def crawl_blog_links(place_id, merchant_name="", target=100, progress_cb=None):
                         if btn.is_visible(timeout=1500):
                             btn.scroll_into_view_if_needed()
                             btn.click()
-                            page.wait_for_timeout(1500)
+                            time.sleep(1.5)
                             clicked = True
                             break
                     except Exception:
@@ -642,7 +643,7 @@ def classify_blog_originals(blog_links, progress_cb=None):
                 try:
                     url = item["url"].replace("m.blog.naver.com","blog.naver.com")
                     page.goto(url, wait_until="domcontentloaded", timeout=8000)
-                    page.wait_for_timeout(800)
+                    time.sleep(0.8)
 
                     full_text = ""
                     try:
@@ -729,7 +730,7 @@ def crawl_naver_search_count(merchant_name, region):
                 f"https://search.naver.com/search.naver?query={quote(query)}&where=blog",
                 wait_until="domcontentloaded", timeout=20000
             )
-            page.wait_for_timeout(1500)
+            time.sleep(1.5)
             text = page.inner_text("body")
             m = re.search(r'약\s*([\d,]+)\s*개', text)
             if m: count = int(m.group(1).replace(",",""))
@@ -756,7 +757,7 @@ def crawl_instagram_count(tag):
                 f"https://www.instagram.com/explore/tags/{clean}/",
                 wait_until="domcontentloaded", timeout=25000
             )
-            page.wait_for_timeout(3500)
+            time.sleep(3.5)
             text = page.inner_text("body")
             for pat, unit in [
                 (r'([\d.]+)만\s*(?:개\s*)?게시물',"만"),
@@ -941,7 +942,7 @@ def crawl_merchant(job_id, merchant):
 # API 엔드포인트
 # ════════════════════════════════════════════════════════════
 @app.get("/")
-async def root(): return {"message":"SNS 분석 솔루션 API v30"}
+async def root(): return {"message":"SNS 분석 솔루션 API v31"}
 
 @app.get("/api/merchants")
 async def get_merchants(): return MERCHANTS
