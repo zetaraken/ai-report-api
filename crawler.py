@@ -256,7 +256,8 @@ def crawl_receipt_reviews(place_id, target=500):
 
                     current = len(reviews)
                     global_round = (session_num - 1) * ROUNDS_PER_SESSION + round_num
-                    print(f"[영수증] 세션{session_num} 라운드{round_num}(전체{global_round}): +{new_count}건 → 누적 {current}건")
+                    dup_count = len([t for t in (texts or []) if len(t.strip()) >= 10]) - new_count
+                    print(f"[영수증] 세션{session_num} 라운드{round_num}(전체{global_round}): +{new_count}건(중복{dup_count}건) → 누적 {current}건")
 
                     _write_progress(
                         f"영수증리뷰 수집 중... ({current}건 / 목표 {target}건, 세션{session_num}-{round_num}라운드)",
@@ -268,10 +269,13 @@ def crawl_receipt_reviews(place_id, target=500):
                         browser.close()
                         return True  # 완료
 
-                    if new_count == 0:
+                    # zero_streak: 텍스트 자체가 없을 때만 누적
+                    # 중복으로 걸러진 경우(dup_count > 0)는 아직 읽을 리뷰가 있는 것
+                    texts_found = len([t for t in (texts or []) if len(t.strip()) >= 10])
+                    if texts_found == 0:
                         zero_streak += 1
                         if zero_streak >= 5:
-                            print(f"[영수증] +0건 5회 연속 → 세션 종료")
+                            print(f"[영수증] 텍스트 없음 5회 연속 → 세션 종료")
                             break
                         if zero_streak >= 3:
                             for _ in range(6):
@@ -281,7 +285,7 @@ def crawl_receipt_reviews(place_id, target=500):
                                 except Exception:
                                     pass
                     else:
-                        zero_streak = 0
+                        zero_streak = 0  # 중복이든 신규든 텍스트가 있으면 리셋
 
                     try:
                         clicked = page.evaluate(JS_CLICK_BTN)
