@@ -193,7 +193,7 @@ def crawl_receipt_reviews(place_id, target=500):
 
     # ── 세션 단위 크롤링 함수 ─────────────────────────────────
     # 브라우저 1회 실행당 최대 ROUNDS_PER_SESSION 라운드 수행
-    ROUNDS_PER_SESSION = 15  # 15라운드마다 재시작 (hang 지점 18라운드보다 일찍 교체)
+    ROUNDS_PER_SESSION = 10  # 10라운드마다 재시작 (27라운드 hang 지점 원천 회피)
 
     def run_session(session_num):
         """브라우저 새로 시작 → 최대 ROUNDS_PER_SESSION 라운드 수집 → 종료"""
