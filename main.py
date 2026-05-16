@@ -202,102 +202,143 @@ def get_official_counts(place_id):
 # ════════════════════════════════════════════════════════════
 # STEP 1: 영수증(방문자) 리뷰
 # 동작: ① 맨 아래 스크롤 → ② "펼쳐서 더보기" 클릭 → 반복
+# URL: 모바일 우선, 실패 시 PC 버전 시도
 # ════════════════════════════════════════════════════════════
 def crawl_receipt_reviews(place_id, target=300, progress_cb=None):
     reviews = []
     seen_texts = set()
 
-    try:
-        with sync_playwright() as p:
-            browser, ctx = make_pc_browser(p)
-            page = ctx.new_page()
+    urls_to_try = [
+        ("mobile", f"https://m.place.naver.com/restaurant/{place_id}/review/visitor?entry=ple&reviewSort=recent"),
+        ("pc",     f"https://pcmap.place.naver.com/restaurant/{place_id}/review/visitor?entry=ple&reviewSort=recent"),
+    ]
 
-            url = (
-                f"https://pcmap.place.naver.com/restaurant/{place_id}"
-                f"/review/visitor?entry=ple&reviewSort=recent"
-            )
-            print(f"[영수증] 접속: {url}")
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(3000)
-            print(f"[영수증] 페이지 텍스트 길이: {len(page.inner_text('body'))}자")
+    for url_type, attempt_url in urls_to_try:
+        print(f"[영수증] 시도({url_type}): {attempt_url}")
+        try:
+            with sync_playwright() as p:
+                if url_type == "mobile":
+                    browser, ctx = make_mobile_browser(p)
+                else:
+                    browser, ctx = make_pc_browser(p)
 
-            round_num = 0
-            max_rounds = 60  # 최대 60라운드 (라운드당 ~10건 × 60 = 600건 커버)
+                page = ctx.new_page()
+                page.goto(attempt_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3000)
 
-            while round_num < max_rounds:
-                round_num += 1
+                body_text = page.inner_text("body")
+                print(f"[영수증] 텍스트 길이: {len(body_text)}자")
+                print(f"[영수증] 샘플(100자): {body_text[:100]}")
 
-                # ① 화면 맨 아래까지 스크롤 (충분히 여러 번)
-                for _ in range(6):
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.wait_for_timeout(400)
+                # 페이지 정상 로드 확인
+                is_valid = len(body_text) > 300 and any(
+                    kw in body_text for kw in ["리뷰","별점","방문","영수증","음식"]
+                )
+                if not is_valid:
+                    print(f"[영수증] 페이지 유효하지 않음 → 다음 URL")
+                    browser.close()
+                    continue
 
-                # ② 현재 로드된 리뷰 수집
-                _collect_reviews_from_page(page, reviews, seen_texts)
-                current = len(reviews)
+                round_num = 0
+                max_rounds = 60
 
-                if progress_cb:
-                    progress_cb(current, target,
-                        f"영수증리뷰 수집 중... ({current}건 / 목표 {target}건, {round_num}라운드)")
-                print(f"[영수증] 라운드 {round_num}: {current}건")
+                while round_num < max_rounds:
+                    round_num += 1
 
-                if current >= target:
-                    print(f"[영수증] 목표 달성: {current}건")
+                    # ① 맨 아래까지 스크롤
+                    for _ in range(6):
+                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        page.wait_for_timeout(400)
+
+                    # ② 리뷰 수집
+                    html = page.content()
+                    _collect_reviews_from_html(html, reviews, seen_texts, round_num)
+                    current = len(reviews)
+
+                    if progress_cb:
+                        progress_cb(current, target,
+                            f"영수증리뷰 수집 중... ({current}건 / 목표 {target}건, {round_num}라운드)")
+                    print(f"[영수증] 라운드 {round_num}: {current}건")
+
+                    if current >= target:
+                        break
+
+                    # ③ "펼쳐서 더보기" 버튼 클릭
+                    clicked = False
+                    for sel in [
+                        "a:has-text('펼쳐서 더보기')",
+                        "button:has-text('펼쳐서 더보기')",
+                        "span:has-text('펼쳐서 더보기')",
+                        "a.fvwqf",
+                        "a.place_bluelink",
+                    ]:
+                        try:
+                            btn = page.locator(sel).last
+                            if btn.is_visible(timeout=1500):
+                                btn.scroll_into_view_if_needed()
+                                page.wait_for_timeout(200)
+                                btn.click()
+                                page.wait_for_timeout(1500)
+                                clicked = True
+                                print(f"[영수증] 버튼 클릭: {sel}")
+                                break
+                        except Exception:
+                            continue
+
+                    if not clicked:
+                        print(f"[영수증] 버튼 없음 → 종료 ({current}건)")
+                        break
+
+                browser.close()
+
+                if len(reviews) > 0:
+                    print(f"[영수증] {url_type} URL 성공")
                     break
 
-                # ③ "펼쳐서 더보기" 버튼 클릭
-                clicked = False
-                for sel in [
-                    "a:has-text('펼쳐서 더보기')",
-                    "button:has-text('펼쳐서 더보기')",
-                    "span:has-text('펼쳐서 더보기')",
-                    "a.fvwqf",
-                    "a.place_bluelink",
-                ]:
-                    try:
-                        btn = page.locator(sel).last
-                        if btn.is_visible(timeout=1500):
-                            btn.scroll_into_view_if_needed()
-                            page.wait_for_timeout(200)
-                            btn.click()
-                            page.wait_for_timeout(1500)
-                            clicked = True
-                            print(f"[영수증] '{sel}' 클릭 성공")
-                            break
-                    except Exception:
-                        continue
-
-                if not clicked:
-                    print(f"[영수증] '펼쳐서 더보기' 버튼 없음 → 종료 ({current}건)")
-                    break
-
-            browser.close()
-
-    except Exception as e:
-        print(f"[영수증 오류] {e}")
-        import traceback; traceback.print_exc()
+        except Exception as e:
+            print(f"[영수증 오류] {url_type}: {e}")
+            import traceback; traceback.print_exc()
 
     print(f"[영수증] 최종: {len(reviews)}건")
     return reviews
 
 
-def _collect_reviews_from_page(page, reviews, seen_texts):
-    """현재 페이지 HTML에서 리뷰 텍스트 수집"""
+def _collect_reviews_from_html(html, reviews, seen_texts, round_num=0):
+    """HTML에서 리뷰 텍스트 수집"""
     from bs4 import BeautifulSoup
-    bs = BeautifulSoup(page.content(), "html.parser")
-
+    bs = BeautifulSoup(html, "html.parser")
     SKIP = {"펼쳐서 더보기","더보기","반응 남기기","좋아요","신고","접기","펼치기"}
+
+    # 1라운드에서 진단 로그
+    if round_num == 1:
+        all_li = bs.find_all("li")
+        print(f"[영수증 진단] 전체 li: {len(all_li)}개")
+        if all_li:
+            classes = [str(li.get("class","")) for li in all_li[:8]]
+            print(f"[영수증 진단] li 클래스 샘플: {classes}")
+        all_div = bs.find_all("div", class_=re.compile("vn15t2|review|Review"))
+        print(f"[영수증 진단] review 관련 div: {len(all_div)}개")
 
     for li_sel, content_sel in [
         ("li.pui__X35jYm.EjjAW", "div.pui__vn15t2"),
         ("li.pui__X35jYm",       "div.pui__vn15t2"),
         ("li[class*='pui__X35jYm']", "div[class*='pui__vn15t2']"),
+        ("li.EjjAW",             "div.pui__vn15t2"),
+        (None,                   "div.pui__vn15t2"),  # div 직접
     ]:
-        items = bs.select(li_sel)
-        if len(items) < 2:
+        if li_sel:
+            items = bs.select(li_sel)
+        else:
+            items = bs.select("div.pui__vn15t2")
+
+        if not items:
             continue
+
         for item in items:
-            el = item.select_one(content_sel) or item
+            if content_sel and li_sel:
+                el = item.select_one(content_sel) or item
+            else:
+                el = item
             text = el.get_text(separator=" ", strip=True)
             for s in SKIP:
                 text = text.replace(s, "").strip()
@@ -310,7 +351,8 @@ def _collect_reviews_from_page(page, reviews, seen_texts):
                     "ad_basis": get_basis(text, ad_type),
                     "source": "naver_receipt",
                 })
-        break
+        if items:
+            break
 
 
 # ════════════════════════════════════════════════════════════
