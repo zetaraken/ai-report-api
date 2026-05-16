@@ -246,21 +246,60 @@ def crawl_receipt_reviews(place_id, target=300, progress_cb=None):
                     round_num += 1
 
                     # ① 맨 아래까지 스크롤
-                    for _ in range(6):
+                    for _ in range(5):
                         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        page.wait_for_timeout(400)
+                        page.wait_for_timeout(350)
 
-                    # ② 리뷰 수집
-                    html = page.content()
-                    _collect_reviews_from_html(html, reviews, seen_texts, round_num)
+                    # ② JS로 직접 텍스트 추출 (page.content() + BeautifulSoup 대신 → 메모리 절약)
+                    try:
+                        texts = page.evaluate("""
+                            () => {
+                                const SKIP = new Set(['펼쳐서 더보기','더보기','반응 남기기','좋아요','신고','접기']);
+                                const results = [];
+                                // div.pui__vn15t2 직접 추출
+                                document.querySelectorAll('div.pui__vn15t2').forEach(el => {
+                                    let t = (el.innerText || '').trim();
+                                    SKIP.forEach(s => { t = t.replace(s, '').trim(); });
+                                    if (t.length >= 10) results.push(t);
+                                });
+                                // 폴백: li 전체 텍스트
+                                if (results.length === 0) {
+                                    document.querySelectorAll('li.pui__X35jYm, li[class*="pui__X35jYm"]').forEach(li => {
+                                        let t = (li.innerText || '').trim();
+                                        SKIP.forEach(s => { t = t.replace(s, '').trim(); });
+                                        if (t.length >= 10) results.push(t);
+                                    });
+                                }
+                                return results;
+                            }
+                        """)
+                    except Exception as e:
+                        print(f"[영수증] JS 추출 오류: {e}")
+                        texts = []
+
+                    if round_num == 1:
+                        print(f"[영수증 진단] JS 추출: {len(texts or [])}건, 샘플: {(texts or ['없음'])[0][:60]}")
+
+                    for text in (texts or []):
+                        text = text.strip()
+                        if len(text) >= 10 and text not in seen_texts:
+                            seen_texts.add(text)
+                            ad_type = classify_ad(text)
+                            reviews.append({
+                                "text": text[:500],
+                                "ad_type": ad_type,
+                                "ad_basis": get_basis(text, ad_type),
+                                "source": "naver_receipt",
+                            })
+
                     current = len(reviews)
-
                     if progress_cb:
                         progress_cb(current, target,
                             f"영수증리뷰 수집 중... ({current}건 / 목표 {target}건, {round_num}라운드)")
                     print(f"[영수증] 라운드 {round_num}: {current}건")
 
                     if current >= target:
+                        print(f"[영수증] 목표 달성: {current}건")
                         break
 
                     # ③ "펼쳐서 더보기" 버튼 클릭
@@ -278,7 +317,7 @@ def crawl_receipt_reviews(place_id, target=300, progress_cb=None):
                                 btn.scroll_into_view_if_needed()
                                 page.wait_for_timeout(200)
                                 btn.click()
-                                page.wait_for_timeout(1500)
+                                page.wait_for_timeout(1200)
                                 clicked = True
                                 print(f"[영수증] 버튼 클릭: {sel}")
                                 break
