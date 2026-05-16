@@ -132,7 +132,11 @@ def get_official_counts(place_id):
 
 
 # ════════════════════════════════════════════════════════════
-# STEP 1: 영수증(방문자) 리뷰
+# STEP 1: 영수증(방문자) 리뷰  v35
+# 핵심 변경: 20라운드마다 브라우저 완전 재시작
+#   - Playwright DOM 누적 hang 원천 차단
+#   - seen_texts로 중복 리뷰 필터링 (재시작 후에도 이어서 수집)
+#   - 재시작 시 스크롤을 빠르게 내려서 새 리뷰 위치로 이동
 # ════════════════════════════════════════════════════════════
 def crawl_receipt_reviews(place_id, target=500):
     reviews = []
@@ -185,33 +189,68 @@ def crawl_receipt_reviews(place_id, target=500):
         }
     """
 
-    urls = [
-        ("mobile", f"https://m.place.naver.com/restaurant/{place_id}/review/visitor?entry=ple&reviewSort=recent"),
-        ("pc",     f"https://pcmap.place.naver.com/restaurant/{place_id}/review/visitor?entry=ple&reviewSort=recent"),
-    ]
+    mobile_url = f"https://m.place.naver.com/restaurant/{place_id}/review/visitor?entry=ple&reviewSort=recent"
 
-    for url_type, url in urls:
-        print(f"[영수증] 시도({url_type}): {url}")
+    # ── 세션 단위 크롤링 함수 ─────────────────────────────────
+    # 브라우저 1회 실행당 최대 ROUNDS_PER_SESSION 라운드 수행
+    ROUNDS_PER_SESSION = 18  # 20라운드 전에 재시작 (hang 발생 지점 회피)
+
+    def run_session(session_num):
+        """브라우저 새로 시작 → 최대 ROUNDS_PER_SESSION 라운드 수집 → 종료"""
+        nonlocal reviews, seen_texts
+        collected_this_session = 0
+
+        print(f"[영수증] ▶ 세션 {session_num} 시작 (현재 누적 {len(reviews)}건)")
         try:
             with sync_playwright() as p:
-                browser, ctx = (make_mobile_browser(p) if url_type == "mobile" else make_pc_browser(p))
+                browser, ctx = make_mobile_browser(p)
                 page = ctx.new_page()
                 page.set_default_timeout(15000)
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                page.goto(mobile_url, wait_until="domcontentloaded", timeout=30000)
                 time.sleep(3.0)
 
                 body_text = page.inner_text("body")
-                print(f"[영수증] 로드: {len(body_text)}자")
                 if not (len(body_text) > 300 and any(kw in body_text for kw in ["리뷰","별점","방문","음식"])):
-                    print("[영수증] 유효하지 않음 → 다음 URL")
+                    print(f"[영수증] 세션 {session_num}: 페이지 유효하지 않음")
                     browser.close()
-                    continue
+                    return False  # 재시도 필요
 
+                # 세션 1이 아닌 경우: 이미 수집한 리뷰를 빠르게 스킵
+                # 스크롤을 빠르게 내려서 새 리뷰 영역 도달
+                if session_num > 1:
+                    print(f"[영수증] 세션 {session_num}: 기수집 리뷰 스킵 중...")
+                    skip_round = 0
+                    while skip_round < (session_num - 1) * ROUNDS_PER_SESSION:
+                        skip_round += 1
+                        for _ in range(4):
+                            try:
+                                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                                time.sleep(0.15)  # 스킵 시엔 빠르게
+                            except Exception:
+                                pass
+                        # 버튼 클릭 (새 리뷰 로드)
+                        try:
+                            page.evaluate(JS_CLICK_BTN)
+                            time.sleep(0.8)
+                        except Exception:
+                            break
+                        # 수집하되 seen_texts에 있으면 카운트 안 함 (중복 차단)
+                        try:
+                            texts = page.evaluate(JS_COLLECT)
+                            for text in (texts or []):
+                                t = text.strip()
+                                if len(t) >= 10:
+                                    seen_texts.add(t)  # 스킵 중엔 seen_texts만 업데이트
+                        except Exception:
+                            break
+                    print(f"[영수증] 세션 {session_num}: 스킵 완료, 실제 수집 시작")
+
+                # 실제 수집 라운드
                 round_num = 0
                 zero_streak = 0
                 no_btn_streak = 0
 
-                while round_num < 120:
+                while round_num < ROUNDS_PER_SESSION:
                     round_num += 1
 
                     for _ in range(4):
@@ -224,7 +263,7 @@ def crawl_receipt_reviews(place_id, target=500):
                     try:
                         texts = page.evaluate(JS_COLLECT)
                     except Exception as e:
-                        print(f"[영수증] 수집 오류 → 종료: {e}")
+                        print(f"[영수증] 세션 {session_num} 수집 오류: {e}")
                         break
 
                     new_count = 0
@@ -240,25 +279,28 @@ def crawl_receipt_reviews(place_id, target=500):
                                 "source": "naver_receipt",
                             })
                             new_count += 1
+                            collected_this_session += 1
 
                     current = len(reviews)
-                    print(f"[영수증] 라운드 {round_num}: +{new_count}건 → 누적 {current}건")
+                    global_round = (session_num - 1) * ROUNDS_PER_SESSION + round_num
+                    print(f"[영수증] 세션{session_num} 라운드{round_num}(전체{global_round}): +{new_count}건 → 누적 {current}건")
 
-                    # 진행 상태 파일 기록 (main.py가 폴링)
-                    _write_progress(f"영수증리뷰 수집 중... ({current}건 / 목표 {target}건, {round_num}라운드)",
-                                    10 + int((min(current, target) / max(target, 1)) * 28))
+                    _write_progress(
+                        f"영수증리뷰 수집 중... ({current}건 / 목표 {target}건, 세션{session_num}-{round_num}라운드)",
+                        10 + int((min(current, target) / max(target, 1)) * 28)
+                    )
 
                     if current >= target:
                         print(f"[영수증] 목표 달성: {current}건")
-                        break
+                        browser.close()
+                        return True  # 완료
 
                     if new_count == 0:
                         zero_streak += 1
                         if zero_streak >= 5:
-                            print(f"[영수증] +0건 5회 연속 → 종료 ({current}건)")
+                            print(f"[영수증] +0건 5회 연속 → 세션 종료")
                             break
                         if zero_streak >= 3:
-                            print(f"[영수증] +0건 {zero_streak}회 연속 → 추가 스크롤")
                             for _ in range(6):
                                 try:
                                     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -271,18 +313,17 @@ def crawl_receipt_reviews(place_id, target=500):
                     try:
                         clicked = page.evaluate(JS_CLICK_BTN)
                     except Exception as e:
-                        print(f"[영수증] 클릭 오류 → 종료: {e}")
+                        print(f"[영수증] 세션 {session_num} 클릭 오류: {e}")
                         break
 
                     if clicked:
                         no_btn_streak = 0
-                        print(f"[영수증] JS 버튼 클릭 성공 ({clicked}) — 라운드 {round_num}")
+                        print(f"[영수증] JS 버튼 클릭 성공 ({clicked})")
                         time.sleep(1.2)
                     else:
                         no_btn_streak += 1
-                        print(f"[영수증] 버튼 없음 (연속 {no_btn_streak}회)")
                         if no_btn_streak >= 3:
-                            print("[영수증] 버튼 3회 연속 미발견 → 종료")
+                            print("[영수증] 버튼 3회 연속 미발견 → 세션 종료")
                             break
                         for _ in range(3):
                             try:
@@ -294,16 +335,28 @@ def crawl_receipt_reviews(place_id, target=500):
                     if round_num % 5 == 0:
                         try:
                             removed = page.evaluate(JS_REMOVE)
-                            print(f"[영수증] DOM 정리: {removed}개 제거 (라운드 {round_num})")
+                            print(f"[영수증] DOM 정리: {removed}개 제거")
                         except Exception:
                             pass
 
                 browser.close()
-                if reviews:
-                    print(f"[영수증] {url_type} 성공 — {len(reviews)}건")
-                    break
+                print(f"[영수증] 세션 {session_num} 완료: +{collected_this_session}건")
+                return collected_this_session > 0  # 수집된 게 있으면 다음 세션 계속
+
         except Exception as e:
-            print(f"[영수증 오류] {url_type}: {e}")
+            print(f"[영수증] 세션 {session_num} 오류: {e}")
+            return len(reviews) > 0
+
+    # ── 세션 반복 실행 ────────────────────────────────────────
+    MAX_SESSIONS = 10
+    for session_num in range(1, MAX_SESSIONS + 1):
+        done = run_session(session_num)
+        if len(reviews) >= target:
+            print(f"[영수증] 목표 달성으로 종료")
+            break
+        if not done:
+            print(f"[영수증] 세션 {session_num} 수집 없음 → 종료")
+            break
 
     print(f"[영수증] 최종: {len(reviews)}건")
     return reviews
