@@ -1,5 +1,5 @@
 """
-SNS 분석 자동화 솔루션 - 백엔드 API v29
+SNS 분석 자동화 솔루션 - 백엔드 API v30
 영수증리뷰 수집 방식 (영상+버튼 텍스트 확인):
   ① 화면 맨 아래까지 스크롤
   ② "펼쳐서 더보기" 버튼 클릭
@@ -29,7 +29,7 @@ try:
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
-app = FastAPI(title="SNS 분석 솔루션 API", version="29.0.0")
+app = FastAPI(title="SNS 분석 솔루션 API", version="30.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -236,12 +236,16 @@ def get_official_counts(place_id):
 
 
 # ════════════════════════════════════════════════════════════
-# STEP 1: 영수증(방문자) 리뷰  v29
-# 변경 사항:
-#   ① 버튼 클릭: Playwright click() → JS evaluate click() (hang 방지)
-#   ② DOM 정리: display:none → parentNode.removeChild() 완전 제거
-#   ③ 페이지 리로드 복구: 20라운드마다 reload 후 재스크롤 (DOM 폭발 방지)
-#   ④ 버튼 미발견 연속 3회 → 종료 (일시적 렌더 지연 오탐 방지)
+# STEP 1: 영수증(방문자) 리뷰  v30
+# 변경 사항 (v29 → v30):
+#   ① 페이지 리로드 전략 제거
+#      - 리로드하면 네이버가 1번 리뷰부터 다시 로드 → seen_texts 충돌 → +0건 무한반복
+#   ② DOM 완전 제거 주기 단축: 8라운드 → 5라운드
+#   ③ DOM 제거 대상 확대: li 뿐만 아니라 div.pui__vn15t2 도 remove()
+#   ④ +0건 연속 카운트 도입:
+#      - 3회 연속 +0건이면 추가 스크롤(6회) 후 재시도
+#      - 5회 연속 +0건이면 완전 종료 (버튼 클릭돼도 더 이상 새 리뷰 없음)
+#   ⑤ 버튼 클릭: JS evaluate 방식 유지 (v29에서 hang 문제 해결됨)
 # ════════════════════════════════════════════════════════════
 def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
     reviews = []
@@ -258,14 +262,12 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
         () => {
             const SKIP = new Set(['펼쳐서 더보기','더보기','반응 남기기','좋아요','신고','접기']);
             const r = [];
-            // 1차: div.pui__vn15t2 (텍스트 블록)
             document.querySelectorAll('div.pui__vn15t2').forEach(el => {
                 if (el.dataset.collected === '1') return;
                 let t = (el.innerText || '').trim();
                 SKIP.forEach(s => { t = t.replace(s, '').trim(); });
                 if (t.length >= 10) { r.push(t); el.dataset.collected = '1'; }
             });
-            // 2차 폴백: li 전체
             if (!r.length) {
                 document.querySelectorAll('li.pui__X35jYm, li[class*="pui__X35jYm"]').forEach(li => {
                     if (li.dataset.collected === '1') return;
@@ -281,27 +283,29 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
     # ② JS 클릭 (Playwright click() 대신 — DOM 누적 시 hang 방지)
     JS_CLICK_BTN = """
         () => {
-            // 텍스트 기반 탐색
             const byText = [...document.querySelectorAll('a, button, span')].find(
                 el => (el.innerText || '').trim().includes('펼쳐서 더보기')
             );
             if (byText) { byText.click(); return 'text'; }
-            // 클래스 기반 폴백
             const byClass = document.querySelector('a.fvwqf, a.place_bluelink');
             if (byClass) { byClass.click(); return 'class'; }
             return null;
         }
     """
 
-    # ③ 수집 완료 노드 DOM에서 완전 제거 (display:none보다 메모리 효과 큼)
+    # ③ 수집 완료 노드 DOM에서 완전 제거 (li + div 모두)
     JS_REMOVE_COLLECTED = """
         () => {
             let cnt = 0;
+            // li 노드 제거
             document.querySelectorAll(
                 'li.pui__X35jYm[data-collected="1"], li[class*="pui__X35jYm"][data-collected="1"]'
             ).forEach(li => {
-                try { li.parentNode && li.parentNode.removeChild(li); cnt++; }
-                catch(e) {}
+                try { li.parentNode && li.parentNode.removeChild(li); cnt++; } catch(e) {}
+            });
+            // div.pui__vn15t2 제거 (li 제거 후 남은 경우)
+            document.querySelectorAll('div.pui__vn15t2[data-collected="1"]').forEach(div => {
+                try { div.parentNode && div.parentNode.removeChild(div); cnt++; } catch(e) {}
             });
             return cnt;
         }
@@ -330,24 +334,13 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                     continue
 
                 round_num        = 0
-                MAX_ROUNDS       = 100
-                CLEANUP_INTERVAL = 8   # 8라운드마다 DOM 완전 제거
-                RELOAD_INTERVAL  = 20  # 20라운드마다 페이지 리로드로 DOM 초기화
-                no_btn_streak    = 0   # 버튼 미발견 연속 카운트
+                MAX_ROUNDS       = 120
+                CLEANUP_INTERVAL = 5    # 5라운드마다 DOM 완전 제거
+                zero_streak      = 0    # +0건 연속 카운트
+                no_btn_streak    = 0    # 버튼 미발견 연속 카운트
 
                 while round_num < MAX_ROUNDS:
                     round_num += 1
-
-                    # ── 주기적 페이지 리로드 (DOM 폭발 방지) ──────────
-                    if round_num > 1 and round_num % RELOAD_INTERVAL == 1:
-                        current_before = len(reviews)
-                        print(f"[영수증] {round_num}라운드 — 페이지 리로드로 DOM 초기화 (현재 {current_before}건)")
-                        try:
-                            page.reload(wait_until="domcontentloaded", timeout=30000)
-                            page.wait_for_timeout(3000)
-                            # 리로드 후: 이미 수집한 텍스트는 seen_texts 로 중복 차단됨
-                        except Exception as e:
-                            print(f"[영수증] 리로드 실패: {e}")
 
                     # ① 맨 아래 스크롤 (4회)
                     for _ in range(4):
@@ -388,7 +381,25 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                         print(f"[영수증] 목표 달성: {current}건")
                         break
 
-                    # ③ JS로 버튼 클릭 (Playwright click() 사용 안 함)
+                    # +0건 연속 처리
+                    if new_count == 0:
+                        zero_streak += 1
+                        if zero_streak >= 5:
+                            print(f"[영수증] +0건 5회 연속 → 더 이상 새 리뷰 없음, 종료 ({current}건)")
+                            break
+                        if zero_streak >= 3:
+                            # 추가 스크롤로 새 리뷰 로드 유도
+                            print(f"[영수증] +0건 {zero_streak}회 연속 → 추가 스크롤 시도")
+                            for _ in range(6):
+                                try:
+                                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                                    page.wait_for_timeout(400)
+                                except Exception:
+                                    pass
+                    else:
+                        zero_streak = 0
+
+                    # ③ JS로 버튼 클릭
                     try:
                         clicked_type = page.evaluate(JS_CLICK_BTN)
                     except Exception as e:
@@ -398,7 +409,6 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                     if clicked_type:
                         no_btn_streak = 0
                         print(f"[영수증] JS 버튼 클릭 성공 ({clicked_type}) — 라운드 {round_num}")
-                        # 클릭 후 로드 대기 (짧게, Playwright 블로킹 없음)
                         try:
                             page.wait_for_timeout(1200)
                         except Exception:
@@ -409,7 +419,6 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                         if no_btn_streak >= 3:
                             print(f"[영수증] 버튼 3회 연속 미발견 → 종료")
                             break
-                        # 버튼 없을 때 추가 스크롤 후 재시도
                         for _ in range(3):
                             try:
                                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -417,11 +426,11 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                             except Exception:
                                 pass
 
-                    # ④ DOM 노드 완전 제거 (메모리 관리)
+                    # ④ DOM 노드 완전 제거 (5라운드마다)
                     if round_num % CLEANUP_INTERVAL == 0:
                         try:
                             removed = page.evaluate(JS_REMOVE_COLLECTED)
-                            print(f"[영수증] DOM 정리: {removed}개 노드 완전 제거")
+                            print(f"[영수증] DOM 정리: {removed}개 노드 완전 제거 (라운드 {round_num})")
                         except Exception as e:
                             print(f"[영수증] DOM 정리 오류: {e}")
 
@@ -932,7 +941,7 @@ def crawl_merchant(job_id, merchant):
 # API 엔드포인트
 # ════════════════════════════════════════════════════════════
 @app.get("/")
-async def root(): return {"message":"SNS 분석 솔루션 API v29"}
+async def root(): return {"message":"SNS 분석 솔루션 API v30"}
 
 @app.get("/api/merchants")
 async def get_merchants(): return MERCHANTS
