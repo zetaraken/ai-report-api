@@ -175,9 +175,16 @@ def make_mobile_browser(p):
 
 # ════════════════════════════════════════════════════════════
 # STEP 0: 공식 리뷰 수 파싱
+# 방문자 리뷰 239 = 텍스트리뷰 + 키워드·별점리뷰(텍스트 없음)
+# 실제 수집 가능한 텍스트 리뷰 수 = 239 - 키워드·별점리뷰 수
 # ════════════════════════════════════════════════════════════
 def get_official_counts(place_id):
-    counts = {"receipt_total": 0, "blog_total": 0}
+    counts = {
+        "receipt_total": 0,      # 방문자 리뷰 전체 (텍스트+별점만)
+        "receipt_text_total": 0, # 실제 텍스트 리뷰 수 (수집 가능)
+        "receipt_keyword": 0,    # 키워드·별점만 리뷰 수 (텍스트 없음)
+        "blog_total": 0,
+    }
     try:
         with sync_playwright() as p:
             browser, ctx = make_pc_browser(p)
@@ -189,11 +196,30 @@ def get_official_counts(place_id):
             page.wait_for_timeout(3000)
             text = page.inner_text("body")
             browser.close()
+
         m1 = re.search(r'방문자\s*리뷰\s*([\d,]+)', text)
         m2 = re.search(r'블로그\s*리뷰\s*([\d,]+)', text)
-        if m1: counts["receipt_total"] = int(m1.group(1).replace(",",""))
-        if m2: counts["blog_total"]    = int(m2.group(1).replace(",",""))
-        print(f"[공식 수] {counts}")
+        # 키워드·별점 리뷰 수 파싱 (예: "키워드·별점 리뷰 14")
+        m3 = re.search(r'키워드[·\s]*별점\s*리뷰\s*([\d,]+)', text)
+
+        if m1:
+            counts["receipt_total"] = int(m1.group(1).replace(",",""))
+        if m2:
+            counts["blog_total"] = int(m2.group(1).replace(",",""))
+        if m3:
+            counts["receipt_keyword"] = int(m3.group(1).replace(",",""))
+
+        # 실제 텍스트 리뷰 수 계산
+        if counts["receipt_total"] > 0:
+            counts["receipt_text_total"] = max(
+                counts["receipt_total"] - counts["receipt_keyword"],
+                counts["receipt_total"]  # 키워드 수 파싱 실패 시 전체 수 사용
+            )
+            if counts["receipt_keyword"] > 0:
+                counts["receipt_text_total"] = counts["receipt_total"] - counts["receipt_keyword"]
+
+        print(f"[공식 수] 방문자:{counts['receipt_total']} 키워드별점:{counts['receipt_keyword']} 텍스트:{counts['receipt_text_total']} 블로그:{counts['blog_total']}")
+
     except Exception as e:
         print(f"[공식 수 오류] {e}")
     return counts
@@ -727,8 +753,13 @@ def crawl_merchant(job_id, merchant):
         result["place_counts"] = counts
 
         # 1. 영수증 리뷰
-        official_r = counts.get("receipt_total", 0)
-        upd(10, f"영수증리뷰 수집 중... (공식 {official_r}건)")
+        official_r    = counts.get("receipt_total", 0)      # 방문자 리뷰 전체 (239)
+        official_text = counts.get("receipt_text_total", 0) # 사진·영상 리뷰 (225)
+        official_kw   = counts.get("receipt_keyword", 0)    # 키워드·별점 리뷰 (14)
+        # 수집 목표: 사진·영상 리뷰 수 (텍스트 있는 것만)
+        crawl_target = min((official_text or official_r or 250), 300)
+
+        upd(10, f"영수증리뷰 수집 중... (사진·영상 {official_text or official_r}건 목표)")
 
         def receipt_progress(loaded, total, msg=None):
             pct = 10 + int((min(loaded, total) / max(total,1)) * 28)
@@ -736,7 +767,7 @@ def crawl_merchant(job_id, merchant):
 
         receipt = crawl_receipt_reviews(
             place_id,
-            target=min(official_r or 250, 300),
+            target=crawl_target,
             progress_cb=receipt_progress,
         )
         result["naver_receipt_reviews"] = receipt
@@ -793,12 +824,17 @@ def crawl_merchant(job_id, merchant):
     blog_list    = result["naver_blog_reviews"]
 
     result["summary"] = {
-        "official_receipt_count": result["place_counts"].get("receipt_total",0),
-        "official_blog_count":    result["place_counts"].get("blog_total",0),
+        # 방문자 리뷰 상세 구분
+        "official_receipt_count":      result["place_counts"].get("receipt_total", 0),       # 전체 (239)
+        "official_receipt_text_count": result["place_counts"].get("receipt_text_total", 0),  # 사진·영상 (225)
+        "official_receipt_keyword":    result["place_counts"].get("receipt_keyword", 0),     # 키워드·별점 (14)
+        "official_blog_count":         result["place_counts"].get("blog_total", 0),
+        # 실제 수집 수
         "total_receipt_reviews":  len(receipt_list),
         "total_blog_reviews":     len(blog_list),
         "naver_search_count":     result["naver_search_count"],
         "instagram_count":        result["instagram_count"],
+        # 광고 판별
         "blog_ad_count":      sum(1 for r in blog_list if r["ad_type"]=="광고"),
         "blog_organic_count": sum(1 for r in blog_list if r["ad_type"]=="내돈내산"),
         "blog_unknown_count": sum(1 for r in blog_list if r["ad_type"]=="판별불가"),
