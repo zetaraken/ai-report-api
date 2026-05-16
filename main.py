@@ -240,7 +240,7 @@ def get_official_counts(place_id):
 # 동작: ① 맨 아래 스크롤 → ② "펼쳐서 더보기" 클릭 → 반복
 # URL: 모바일 우선, 실패 시 PC 버전 시도
 # ════════════════════════════════════════════════════════════
-def crawl_receipt_reviews(place_id, target=300, progress_cb=None):
+def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
     reviews = []
     seen_texts = set()
 
@@ -276,7 +276,7 @@ def crawl_receipt_reviews(place_id, target=300, progress_cb=None):
                     continue
 
                 round_num = 0
-                max_rounds = 60
+                max_rounds = 80  # 최대 80라운드 (라운드당 ~10건 × 80 = 800건 커버)
 
                 while round_num < max_rounds:
                     round_num += 1
@@ -763,11 +763,11 @@ def crawl_merchant(job_id, merchant):
         result["place_counts"] = counts
 
         # 1. 영수증 리뷰
-        official_r    = counts.get("receipt_total", 0)      # 방문자 리뷰 전체 (239)
-        official_text = counts.get("receipt_text_total", 0) # 사진·영상 리뷰 (225)
-        official_kw   = counts.get("receipt_keyword", 0)    # 키워드·별점 리뷰 (14)
-        # 수집 목표: 사진·영상 리뷰 수 (텍스트 있는 것만)
-        crawl_target = min((official_text or official_r or 250), 300)
+        official_r    = counts.get("receipt_total", 0)      # 방문자 리뷰 전체
+        official_text = counts.get("receipt_text_total", 0) # 사진·영상 리뷰
+        official_kw   = counts.get("receipt_keyword", 0)    # 키워드·별점 리뷰
+        # 수집 목표: 사진·영상 리뷰 수 기준, 상한 500건
+        crawl_target = min((official_text or official_r or 250), 500)
 
         upd(10, f"영수증리뷰 수집 중... (사진·영상 {official_text or official_r}건 목표)")
 
