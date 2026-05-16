@@ -215,36 +215,7 @@ def crawl_receipt_reviews(place_id, target=500):
                     browser.close()
                     return False  # 재시도 필요
 
-                # 세션 1이 아닌 경우: 이미 수집한 리뷰를 빠르게 스킵
-                # 스크롤을 빠르게 내려서 새 리뷰 영역 도달
-                if session_num > 1:
-                    print(f"[영수증] 세션 {session_num}: 기수집 리뷰 스킵 중...")
-                    skip_round = 0
-                    while skip_round < (session_num - 1) * ROUNDS_PER_SESSION:
-                        skip_round += 1
-                        for _ in range(4):
-                            try:
-                                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                                time.sleep(0.15)  # 스킵 시엔 빠르게
-                            except Exception:
-                                pass
-                        # 버튼 클릭 (새 리뷰 로드)
-                        try:
-                            page.evaluate(JS_CLICK_BTN)
-                            time.sleep(0.8)
-                        except Exception:
-                            break
-                        # 수집하되 seen_texts에 있으면 카운트 안 함 (중복 차단)
-                        try:
-                            texts = page.evaluate(JS_COLLECT)
-                            for text in (texts or []):
-                                t = text.strip()
-                                if len(t) >= 10:
-                                    seen_texts.add(t)  # 스킵 중엔 seen_texts만 업데이트
-                        except Exception:
-                            break
-                    print(f"[영수증] 세션 {session_num}: 스킵 완료, 실제 수집 시작")
-
+                # 세션 시작 → 바로 수집 (스킵 없음, seen_texts가 중복 차단)
                 # 실제 수집 라운드
                 round_num = 0
                 zero_streak = 0
@@ -280,6 +251,8 @@ def crawl_receipt_reviews(place_id, target=500):
                             })
                             new_count += 1
                             collected_this_session += 1
+                        elif len(t) >= 10:
+                            seen_texts.add(t)  # 중복이어도 seen_texts에 등록
 
                     current = len(reviews)
                     global_round = (session_num - 1) * ROUNDS_PER_SESSION + round_num
