@@ -1,5 +1,5 @@
 """
-SNS 분석 자동화 솔루션 - 백엔드 API v31
+SNS 분석 자동화 솔루션 - 백엔드 API v32
 영수증리뷰 수집 방식 (영상+버튼 텍스트 확인):
   ① 화면 맨 아래까지 스크롤
   ② "펼쳐서 더보기" 버튼 클릭
@@ -30,7 +30,7 @@ try:
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
-app = FastAPI(title="SNS 분석 솔루션 API", version="31.0.0")
+app = FastAPI(title="SNS 분석 솔루션 API", version="32.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -340,23 +340,59 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                 zero_streak      = 0    # +0건 연속 카운트
                 no_btn_streak    = 0    # 버튼 미발견 연속 카운트
 
+                # ── evaluate 하드 타임아웃 헬퍼 ─────────────────────
+                # page.evaluate()가 DOM 누적 시 Playwright 내부에서
+                # 무한 블로킹되는 현상 방지.
+                # timeout_sec 초 내 반환 안 되면 브라우저 강제 종료 신호.
+                import ctypes
+                _browser_dead = threading.Event()
+
+                def safe_evaluate(fn, timeout_sec=18):
+                    """fn()을 timeout_sec 초 안에 실행. 초과 시 None 반환 + dead 신호."""
+                    result = [None]
+                    exc    = [None]
+                    def worker():
+                        try:    result[0] = fn()
+                        except Exception as e: exc[0] = e
+                    t = threading.Thread(target=worker, daemon=True)
+                    t.start()
+                    t.join(timeout=timeout_sec)
+                    if t.is_alive():
+                        print(f"[영수증] evaluate {timeout_sec}초 타임아웃 → 브라우저 재시작 필요")
+                        _browser_dead.set()
+                        return None
+                    if exc[0]:
+                        raise exc[0]
+                    return result[0]
+                # ─────────────────────────────────────────────────────
+
                 while round_num < MAX_ROUNDS:
+                    # 브라우저 hang 감지 시 루프 탈출
+                    if _browser_dead.is_set():
+                        print(f"[영수증] 브라우저 dead 감지 → 루프 종료 후 재시작")
+                        break
+
                     round_num += 1
 
                     # ① 맨 아래 스크롤 (4회)
                     for _ in range(4):
+                        if _browser_dead.is_set(): break
                         try:
-                            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            safe_evaluate(lambda: page.evaluate("window.scrollTo(0, document.body.scrollHeight)"), 5)
                             time.sleep(0.25)
                         except Exception:
                             pass
 
+                    if _browser_dead.is_set(): break
+
                     # ② 새 텍스트 수집
                     try:
-                        texts = page.evaluate(JS_COLLECT)
+                        texts = safe_evaluate(lambda: page.evaluate(JS_COLLECT), 15)
                     except Exception as e:
                         print(f"[영수증] JS 수집 오류: {e}")
                         texts = []
+
+                    if _browser_dead.is_set(): break
 
                     new_count = 0
                     for text in (texts or []):
@@ -386,34 +422,35 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                     if new_count == 0:
                         zero_streak += 1
                         if zero_streak >= 5:
-                            print(f"[영수증] +0건 5회 연속 → 더 이상 새 리뷰 없음, 종료 ({current}건)")
+                            print(f"[영수증] +0건 5회 연속 → 종료 ({current}건)")
                             break
                         if zero_streak >= 3:
-                            # 추가 스크롤로 새 리뷰 로드 유도
                             print(f"[영수증] +0건 {zero_streak}회 연속 → 추가 스크롤 시도")
                             for _ in range(6):
+                                if _browser_dead.is_set(): break
                                 try:
-                                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                                    safe_evaluate(lambda: page.evaluate("window.scrollTo(0, document.body.scrollHeight)"), 5)
                                     time.sleep(0.4)
                                 except Exception:
                                     pass
                     else:
                         zero_streak = 0
 
+                    if _browser_dead.is_set(): break
+
                     # ③ JS로 버튼 클릭
                     try:
-                        clicked_type = page.evaluate(JS_CLICK_BTN)
+                        clicked_type = safe_evaluate(lambda: page.evaluate(JS_CLICK_BTN), 15)
                     except Exception as e:
                         print(f"[영수증] JS 클릭 오류: {e}")
                         clicked_type = None
 
+                    if _browser_dead.is_set(): break
+
                     if clicked_type:
                         no_btn_streak = 0
                         print(f"[영수증] JS 버튼 클릭 성공 ({clicked_type}) — 라운드 {round_num}")
-                        try:
-                            time.sleep(1.2)
-                        except Exception:
-                            pass
+                        time.sleep(1.2)
                     else:
                         no_btn_streak += 1
                         print(f"[영수증] 버튼 없음 (연속 {no_btn_streak}회) — {current}건")
@@ -421,16 +458,19 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                             print(f"[영수증] 버튼 3회 연속 미발견 → 종료")
                             break
                         for _ in range(3):
+                            if _browser_dead.is_set(): break
                             try:
-                                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                                safe_evaluate(lambda: page.evaluate("window.scrollTo(0, document.body.scrollHeight)"), 5)
                                 time.sleep(0.4)
                             except Exception:
                                 pass
 
+                    if _browser_dead.is_set(): break
+
                     # ④ DOM 노드 완전 제거 (5라운드마다)
                     if round_num % CLEANUP_INTERVAL == 0:
                         try:
-                            removed = page.evaluate(JS_REMOVE_COLLECTED)
+                            removed = safe_evaluate(lambda: page.evaluate(JS_REMOVE_COLLECTED), 10)
                             print(f"[영수증] DOM 정리: {removed}개 노드 완전 제거 (라운드 {round_num})")
                         except Exception as e:
                             print(f"[영수증] DOM 정리 오류: {e}")
@@ -942,7 +982,7 @@ def crawl_merchant(job_id, merchant):
 # API 엔드포인트
 # ════════════════════════════════════════════════════════════
 @app.get("/")
-async def root(): return {"message":"SNS 분석 솔루션 API v31"}
+async def root(): return {"message":"SNS 분석 솔루션 API v32"}
 
 @app.get("/api/merchants")
 async def get_merchants(): return MERCHANTS
