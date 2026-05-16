@@ -193,7 +193,7 @@ def crawl_receipt_reviews(place_id, target=500):
 
     # ── 세션 단위 크롤링 함수 ─────────────────────────────────
     # 브라우저 1회 실행당 최대 ROUNDS_PER_SESSION 라운드 수행
-    ROUNDS_PER_SESSION = 18  # 20라운드 전에 재시작 (hang 발생 지점 회피)
+    ROUNDS_PER_SESSION = 15  # 15라운드마다 재시작 (hang 지점 18라운드보다 일찍 교체)
 
     def run_session(session_num):
         """브라우저 새로 시작 → 최대 ROUNDS_PER_SESSION 라운드 수집 → 종료"""
@@ -215,13 +215,18 @@ def crawl_receipt_reviews(place_id, target=500):
                     browser.close()
                     return False  # 재시도 필요
 
+                # 세션 번호에 따라 최대 라운드 동적 조정
+                # 세션2 이후엔 중복 구간을 통과해야 하므로 더 많은 라운드 필요
+                max_rounds_this_session = ROUNDS_PER_SESSION + (session_num - 1) * ROUNDS_PER_SESSION
+                print(f"[영수증] 세션 {session_num} 최대 라운드: {max_rounds_this_session}")
+
                 # 세션 시작 → 바로 수집 (스킵 없음, seen_texts가 중복 차단)
                 # 실제 수집 라운드
                 round_num = 0
                 zero_streak = 0
                 no_btn_streak = 0
 
-                while round_num < ROUNDS_PER_SESSION:
+                while round_num < max_rounds_this_session:
                     round_num += 1
 
                     for _ in range(4):
