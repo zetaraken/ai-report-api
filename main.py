@@ -237,14 +237,12 @@ def get_official_counts(place_id):
 
 # ════════════════════════════════════════════════════════════
 # STEP 1: 영수증(방문자) 리뷰
-# 동작: ① 맨 아래 스크롤 → ② "펼쳐서 더보기" 클릭 → 반복
-# 메모리: 25라운드마다 브라우저 재시작 (메모리 초기화)
+# 단일 브라우저 세션 유지 + JS로 텍스트 추출
+# 메모리 관리: 수집 완료된 li 노드는 JS로 DOM에서 제거
 # ════════════════════════════════════════════════════════════
 def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
     reviews = []
     seen_texts = set()
-    BATCH = 25          # 브라우저 재시작 주기
-    MAX_ROUNDS = 80     # 최대 라운드 수
 
     urls_to_try = [
         ("mobile", f"https://m.place.naver.com/restaurant/{place_id}/review/visitor?entry=ple&reviewSort=recent"),
@@ -253,146 +251,147 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
 
     for url_type, attempt_url in urls_to_try:
         print(f"[영수증] 시도({url_type}): {attempt_url}")
-        total_rounds = 0
-        url_ok = False
+        try:
+            with sync_playwright() as p:
+                if url_type == "mobile":
+                    browser, ctx = make_mobile_browser(p)
+                else:
+                    browser, ctx = make_pc_browser(p)
 
-        while total_rounds < MAX_ROUNDS:
-            batch_done = 0
-            done_this_batch = False
+                page = ctx.new_page()
+                page.goto(attempt_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3000)
 
-            try:
-                with sync_playwright() as p:
-                    if url_type == "mobile":
-                        browser, ctx = make_mobile_browser(p)
-                    else:
-                        browser, ctx = make_pc_browser(p)
+                body_text = page.inner_text("body")
+                print(f"[영수증] 텍스트: {len(body_text)}자 / {body_text[:80]}")
+                is_valid = len(body_text) > 300 and any(
+                    kw in body_text for kw in ["리뷰","별점","방문","영수증","음식"]
+                )
+                if not is_valid:
+                    print(f"[영수증] 유효하지 않음 → 다음 URL")
+                    browser.close()
+                    continue
 
-                    page = ctx.new_page()
-                    page.goto(attempt_url, wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_timeout(3000)
+                round_num = 0
+                MAX_ROUNDS = 80
+                CLEANUP_INTERVAL = 10  # 10라운드마다 수집완료 노드 제거
 
-                    # 첫 접속 시 유효성 확인
-                    if total_rounds == 0:
-                        body_text = page.inner_text("body")
-                        print(f"[영수증] 텍스트: {len(body_text)}자 / {body_text[:80]}")
-                        is_valid = len(body_text) > 300 and any(
-                            kw in body_text for kw in ["리뷰","별점","방문","영수증","음식"]
-                        )
-                        if not is_valid:
-                            print(f"[영수증] 유효하지 않음 → 다음 URL")
-                            browser.close()
-                            break
+                while round_num < MAX_ROUNDS:
+                    round_num += 1
 
-                    url_ok = True
+                    # ① 맨 아래 스크롤
+                    for _ in range(5):
+                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        page.wait_for_timeout(350)
 
-                    # 이미 수집된 위치까지 스크롤 복원
-                    if total_rounds > 0:
-                        skip_scrolls = total_rounds * 3
-                        for _ in range(min(skip_scrolls, 150)):
-                            page.evaluate("window.scrollBy(0, 400)")
-                            page.wait_for_timeout(80)
-                        page.wait_for_timeout(1000)
-                        print(f"[영수증] 위치 복원 완료 (총 {total_rounds}라운드 지점)")
-
-                    while batch_done < BATCH and total_rounds < MAX_ROUNDS:
-                        total_rounds += 1
-                        batch_done += 1
-
-                        # ① 맨 아래 스크롤
-                        for _ in range(5):
-                            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            page.wait_for_timeout(350)
-
-                        # ② JS 텍스트 추출
-                        try:
-                            texts = page.evaluate("""
-                                () => {
-                                    const SKIP = new Set(['펼쳐서 더보기','더보기','반응 남기기','좋아요','신고','접기']);
-                                    const r = [];
-                                    document.querySelectorAll('div.pui__vn15t2').forEach(el => {
-                                        let t = (el.innerText||'').trim();
-                                        SKIP.forEach(s=>{t=t.replace(s,'').trim();});
-                                        if(t.length>=10) r.push(t);
-                                    });
-                                    if(!r.length){
-                                        document.querySelectorAll('li.pui__X35jYm,li[class*="pui__X35jYm"]').forEach(li=>{
-                                            let t=(li.innerText||'').trim();
-                                            SKIP.forEach(s=>{t=t.replace(s,'').trim();});
-                                            if(t.length>=10) r.push(t);
-                                        });
+                    # ② JS로 새 텍스트만 추출 (이미 수집한 것 제외)
+                    try:
+                        texts = page.evaluate("""
+                            () => {
+                                const SKIP = new Set(['펼쳐서 더보기','더보기','반응 남기기','좋아요','신고','접기']);
+                                const r = [];
+                                document.querySelectorAll('div.pui__vn15t2').forEach(el => {
+                                    if (el.dataset.collected === '1') return;
+                                    let t = (el.innerText||'').trim();
+                                    SKIP.forEach(s=>{t=t.replace(s,'').trim();});
+                                    if(t.length>=10){
+                                        r.push(t);
+                                        el.dataset.collected = '1';
                                     }
-                                    return r;
+                                });
+                                if(!r.length){
+                                    document.querySelectorAll('li.pui__X35jYm,li[class*="pui__X35jYm"]').forEach(li=>{
+                                        if(li.dataset.collected==='1') return;
+                                        let t=(li.innerText||'').trim();
+                                        SKIP.forEach(s=>{t=t.replace(s,'').trim();});
+                                        if(t.length>=10){
+                                            r.push(t);
+                                            li.dataset.collected='1';
+                                        }
+                                    });
+                                }
+                                return r;
+                            }
+                        """)
+                    except Exception as e:
+                        print(f"[영수증] JS 오류: {e}")
+                        texts = []
+
+                    new_count = 0
+                    for text in (texts or []):
+                        t = text.strip()
+                        if len(t) >= 10 and t not in seen_texts:
+                            seen_texts.add(t)
+                            ad_type = classify_ad(t)
+                            reviews.append({
+                                "text": t[:500],
+                                "ad_type": ad_type,
+                                "ad_basis": get_basis(t, ad_type),
+                                "source": "naver_receipt",
+                            })
+                            new_count += 1
+
+                    current = len(reviews)
+                    if progress_cb:
+                        progress_cb(current, target,
+                            f"영수증리뷰 수집 중... ({current}건 / 목표 {target}건, {round_num}라운드)")
+                    print(f"[영수증] 라운드 {round_num}: +{new_count}건 → 누적 {current}건")
+
+                    if current >= target:
+                        print(f"[영수증] 목표 달성: {current}건")
+                        break
+
+                    # ③ 버튼 클릭
+                    clicked = False
+                    for sel in [
+                        "a:has-text('펼쳐서 더보기')",
+                        "button:has-text('펼쳐서 더보기')",
+                        "span:has-text('펼쳐서 더보기')",
+                        "a.fvwqf", "a.place_bluelink",
+                    ]:
+                        try:
+                            btn = page.locator(sel).last
+                            if btn.is_visible(timeout=1500):
+                                btn.scroll_into_view_if_needed()
+                                page.wait_for_timeout(200)
+                                btn.click()
+                                page.wait_for_timeout(1200)
+                                clicked = True
+                                print(f"[영수증] 버튼 클릭: {sel}")
+                                break
+                        except Exception:
+                            continue
+
+                    if not clicked:
+                        print(f"[영수증] 버튼 없음 → 종료 ({current}건)")
+                        break
+
+                    # ④ 메모리 관리: 수집 완료 노드 숨기기 (DOM 유지하되 렌더 비용 제거)
+                    if round_num % CLEANUP_INTERVAL == 0:
+                        try:
+                            removed = page.evaluate("""
+                                () => {
+                                    let cnt = 0;
+                                    document.querySelectorAll('li.pui__X35jYm[data-collected="1"]').forEach(li => {
+                                        li.style.display = 'none';
+                                        cnt++;
+                                    });
+                                    return cnt;
                                 }
                             """)
-                        except Exception as e:
-                            print(f"[영수증] JS 오류: {e}")
-                            texts = []
+                            print(f"[영수증] 메모리 정리: {removed}개 노드 숨김")
+                        except Exception:
+                            pass
 
-                        for text in (texts or []):
-                            t = text.strip()
-                            if len(t) >= 10 and t not in seen_texts:
-                                seen_texts.add(t)
-                                ad_type = classify_ad(t)
-                                reviews.append({
-                                    "text": t[:500],
-                                    "ad_type": ad_type,
-                                    "ad_basis": get_basis(t, ad_type),
-                                    "source": "naver_receipt",
-                                })
+                browser.close()
 
-                        current = len(reviews)
-                        if progress_cb:
-                            progress_cb(current, target,
-                                f"영수증리뷰 수집 중... ({current}건 / 목표 {target}건, {total_rounds}라운드)")
-                        print(f"[영수증] 라운드 {total_rounds}: {current}건")
+                if len(reviews) > 0:
+                    print(f"[영수증] {url_type} 성공")
+                    break
 
-                        if current >= target:
-                            print(f"[영수증] 목표 달성: {current}건")
-                            browser.close()
-                            done_this_batch = True
-                            return reviews
-
-                        # ③ 버튼 클릭
-                        clicked = False
-                        for sel in [
-                            "a:has-text('펼쳐서 더보기')",
-                            "button:has-text('펼쳐서 더보기')",
-                            "span:has-text('펼쳐서 더보기')",
-                            "a.fvwqf", "a.place_bluelink",
-                        ]:
-                            try:
-                                btn = page.locator(sel).last
-                                if btn.is_visible(timeout=1500):
-                                    btn.scroll_into_view_if_needed()
-                                    page.wait_for_timeout(200)
-                                    btn.click()
-                                    page.wait_for_timeout(1200)
-                                    clicked = True
-                                    print(f"[영수증] 버튼 클릭: {sel}")
-                                    break
-                            except Exception:
-                                continue
-
-                        if not clicked:
-                            print(f"[영수증] 버튼 없음 → 종료 ({current}건)")
-                            browser.close()
-                            done_this_batch = True
-                            return reviews
-
-                    browser.close()
-                    print(f"[영수증] 배치 완료 ({total_rounds}라운드), 브라우저 재시작")
-
-            except Exception as e:
-                print(f"[영수증 배치 오류] {e}")
-                import traceback; traceback.print_exc()
-                break
-
-            if done_this_batch:
-                break
-
-        if url_ok:
-            print(f"[영수증] {url_type} URL 사용, {len(reviews)}건")
-            break
+        except Exception as e:
+            print(f"[영수증 오류] {url_type}: {e}")
+            import traceback; traceback.print_exc()
 
     print(f"[영수증] 최종: {len(reviews)}건")
     return reviews
