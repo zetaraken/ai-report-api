@@ -175,48 +175,58 @@ def make_mobile_browser(p):
 
 # ════════════════════════════════════════════════════════════
 # STEP 0: 공식 리뷰 수 파싱
-# 방문자 리뷰 239 = 텍스트리뷰 + 키워드·별점리뷰(텍스트 없음)
-# 실제 수집 가능한 텍스트 리뷰 수 = 239 - 키워드·별점리뷰 수
+# - 홈 페이지: 방문자 리뷰 239, 블로그 리뷰 77
+# - 리뷰 탭 페이지: 키워드·별점 리뷰 14
 # ════════════════════════════════════════════════════════════
 def get_official_counts(place_id):
     counts = {
-        "receipt_total": 0,      # 방문자 리뷰 전체 (텍스트+별점만)
-        "receipt_text_total": 0, # 실제 텍스트 리뷰 수 (수집 가능)
-        "receipt_keyword": 0,    # 키워드·별점만 리뷰 수 (텍스트 없음)
+        "receipt_total": 0,
+        "receipt_text_total": 0,
+        "receipt_keyword": 0,
         "blog_total": 0,
     }
     try:
         with sync_playwright() as p:
             browser, ctx = make_pc_browser(p)
+
+            # 1. 홈 페이지: 방문자 리뷰 / 블로그 리뷰 수
             page = ctx.new_page()
             page.goto(
                 f"https://pcmap.place.naver.com/restaurant/{place_id}/home",
                 wait_until="domcontentloaded", timeout=30000
             )
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(2000)
             text = page.inner_text("body")
+            page.close()
+
+            m1 = re.search(r'방문자\s*리뷰\s*([\d,]+)', text)
+            m2 = re.search(r'블로그\s*리뷰\s*([\d,]+)', text)
+            if m1: counts["receipt_total"] = int(m1.group(1).replace(",",""))
+            if m2: counts["blog_total"]    = int(m2.group(1).replace(",",""))
+
+            # 2. 리뷰 탭 페이지: 키워드·별점 리뷰 수
+            page2 = ctx.new_page()
+            page2.goto(
+                f"https://pcmap.place.naver.com/restaurant/{place_id}/review/visitor",
+                wait_until="domcontentloaded", timeout=30000
+            )
+            page2.wait_for_timeout(2000)
+            text2 = page2.inner_text("body")
+            page2.close()
+
+            # "키워드·별점 리뷰 14" 또는 "키워드 별점 리뷰 14" 패턴
+            m3 = re.search(r'키워드[·\s]*별점\s*리뷰\s*([\d,]+)', text2)
+            if m3:
+                counts["receipt_keyword"] = int(m3.group(1).replace(",",""))
+
             browser.close()
 
-        m1 = re.search(r'방문자\s*리뷰\s*([\d,]+)', text)
-        m2 = re.search(r'블로그\s*리뷰\s*([\d,]+)', text)
-        # 키워드·별점 리뷰 수 파싱 (예: "키워드·별점 리뷰 14")
-        m3 = re.search(r'키워드[·\s]*별점\s*리뷰\s*([\d,]+)', text)
-
-        if m1:
-            counts["receipt_total"] = int(m1.group(1).replace(",",""))
-        if m2:
-            counts["blog_total"] = int(m2.group(1).replace(",",""))
-        if m3:
-            counts["receipt_keyword"] = int(m3.group(1).replace(",",""))
-
-        # 실제 텍스트 리뷰 수 계산
+        # 텍스트 리뷰 수 계산
         if counts["receipt_total"] > 0:
-            counts["receipt_text_total"] = max(
-                counts["receipt_total"] - counts["receipt_keyword"],
-                counts["receipt_total"]  # 키워드 수 파싱 실패 시 전체 수 사용
-            )
             if counts["receipt_keyword"] > 0:
                 counts["receipt_text_total"] = counts["receipt_total"] - counts["receipt_keyword"]
+            else:
+                counts["receipt_text_total"] = counts["receipt_total"]
 
         print(f"[공식 수] 방문자:{counts['receipt_total']} 키워드별점:{counts['receipt_keyword']} 텍스트:{counts['receipt_text_total']} 블로그:{counts['blog_total']}")
 
