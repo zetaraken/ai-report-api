@@ -259,6 +259,7 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                     browser, ctx = make_pc_browser(p)
 
                 page = ctx.new_page()
+                page.set_default_timeout(15000)  # 모든 Playwright 작업 15초 타임아웃
                 page.goto(attempt_url, wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(3000)
 
@@ -280,9 +281,12 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                     round_num += 1
 
                     # ① 맨 아래 스크롤
-                    for _ in range(5):
-                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        page.wait_for_timeout(350)
+                    for _ in range(4):
+                        try:
+                            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            page.wait_for_timeout(250)
+                        except Exception:
+                            pass
 
                     # ② JS로 새 텍스트만 추출 (이미 수집한 것 제외)
                     try:
@@ -353,9 +357,13 @@ def crawl_receipt_reviews(place_id, target=500, progress_cb=None):
                             btn = page.locator(sel).last
                             if btn.is_visible(timeout=1500):
                                 btn.scroll_into_view_if_needed()
-                                page.wait_for_timeout(200)
+                                page.wait_for_timeout(150)
                                 btn.click()
-                                page.wait_for_timeout(1200)
+                                # 클릭 후 대기 - 타임아웃 감지 포함
+                                try:
+                                    page.wait_for_timeout(1000)
+                                except Exception:
+                                    pass
                                 clicked = True
                                 print(f"[영수증] 버튼 클릭: {sel}")
                                 break
@@ -782,17 +790,20 @@ def crawl_merchant(job_id, merchant):
         result["place_counts"] = counts
 
         # 1. 영수증 리뷰
-        official_r    = counts.get("receipt_total", 0)      # 방문자 리뷰 전체
-        official_text = counts.get("receipt_text_total", 0) # 사진·영상 리뷰
-        official_kw   = counts.get("receipt_keyword", 0)    # 키워드·별점 리뷰
-        # 수집 목표: 사진·영상 리뷰 수 기준, 상한 500건
-        crawl_target = min((official_text or official_r or 250), 500)
+        official_r    = counts.get("receipt_total", 0)
+        official_text = counts.get("receipt_text_total", 0)
+        official_kw   = counts.get("receipt_keyword", 0)
+        # crawl_target: 사진·영상 리뷰 수 기준. 파싱 안 됐으면 전체 수 사용
+        crawl_target = official_text if official_text > 0 else official_r
+        crawl_target = min(crawl_target or 250, 500)
 
-        upd(10, f"영수증리뷰 수집 중... (사진·영상 {official_text or official_r}건 목표)")
+        upd(10, f"영수증리뷰 수집 중... (목표 {crawl_target}건)")
 
         def receipt_progress(loaded, total, msg=None):
-            pct = 10 + int((min(loaded, total) / max(total,1)) * 28)
-            upd(min(pct, 38), msg or f"영수증리뷰 수집 중... ({loaded}건)")
+            if total <= 0:
+                return
+            pct = 10 + int((min(loaded, total) / total) * 28)
+            upd(min(pct, 38), msg or f"영수증리뷰 수집 중... ({loaded}/{total}건)")
 
         receipt = crawl_receipt_reviews(
             place_id,
