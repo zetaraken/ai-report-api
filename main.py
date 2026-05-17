@@ -76,11 +76,11 @@ executor = ThreadPoolExecutor(max_workers=2)
 
 # ── Pydantic ──────────────────────────────────────────────────────
 class MerchantCreate(BaseModel):
-    name: str; region: str; place_id: str; instagram_tag: Optional[str] = ""
+    name: str; place_id: str; instagram_tag: Optional[str] = ""; addr_keyword: Optional[str] = ""
 
 class MerchantUpdate(BaseModel):
-    name: Optional[str]=None; region: Optional[str]=None
-    place_id: Optional[str]=None; instagram_tag: Optional[str]=None
+    name: Optional[str]=None; place_id: Optional[str]=None
+    instagram_tag: Optional[str]=None; addr_keyword: Optional[str]=None
 
 class CrawlRequest(BaseModel):
     merchant_id: str
@@ -90,10 +90,11 @@ class CrawlRequest(BaseModel):
 # 크롤링 오케스트레이터 — subprocess로 crawler.py 실행
 # ════════════════════════════════════════════════════════════
 def crawl_merchant(job_id, merchant):
-    place_id = merchant["place_id"]
-    name     = merchant["name"]
-    region   = merchant.get("region", "")
-    ig_tag   = merchant.get("instagram_tag") or name
+    place_id     = merchant["place_id"]
+    name         = merchant["name"]
+    region       = merchant.get("addr_keyword", "")   # addr_keyword가 region 역할 대체
+    ig_tag       = merchant.get("instagram_tag") or name
+    addr_keyword = merchant.get("addr_keyword", "")
 
     def upd(pct, msg):
         job = CRAWL_JOBS.get(job_id, {})
@@ -144,6 +145,7 @@ def crawl_merchant(job_id, merchant):
             place_id, name, region, ig_tag,
             str(crawl_target), str(blog_target),
             str(output_path), str(progress_path),
+            addr_keyword,
         ]
 
         print(f"[v34] subprocess 시작: {' '.join(cmd)}")
@@ -235,8 +237,9 @@ async def get_merchants(): return MERCHANTS
 
 @app.post("/api/merchants")
 async def add_merchant(data: MerchantCreate):
-    m = {"id": str(uuid.uuid4())[:8], "name": data.name, "region": data.region,
+    m = {"id": str(uuid.uuid4())[:8], "name": data.name,
          "place_id": data.place_id, "instagram_tag": data.instagram_tag or data.name,
+         "addr_keyword": data.addr_keyword or "",
          "created_at": datetime.now().isoformat()}
     MERCHANTS.append(m); save_merchants(); return m
 
@@ -244,7 +247,7 @@ async def add_merchant(data: MerchantCreate):
 async def update_merchant(mid: str, data: MerchantUpdate):
     m = next((m for m in MERCHANTS if m["id"] == mid), None)
     if not m: raise HTTPException(404, "가맹점 없음")
-    for f in ["name", "region", "place_id", "instagram_tag"]:
+    for f in ["name", "place_id", "instagram_tag", "addr_keyword"]:
         v = getattr(data, f)
         if v is not None: m[f] = v
     save_merchants(); return m

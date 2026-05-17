@@ -848,6 +848,7 @@ if __name__ == "__main__":
     blog_target   = int(args[5])
     output_path   = args[6]
     _progress_path = args[7] if len(args) > 7 else None
+    addr_keyword  = args[8] if len(args) > 8 else ""  # 동네명 (수동 입력)
 
     print(f"[크롤러 시작] place_id={place_id} target={crawl_target}")
 
@@ -864,7 +865,11 @@ if __name__ == "__main__":
     blog_reviews = classify_blog_originals(blog_links)
 
     _write_progress("네이버 검색결과 집계 중...", 80)
-    naver_cnt = crawl_naver_search_count(merchant_name, region, counts.get("addr_keyword", ""))
+    # 수동 입력 동네명 우선, 없으면 자동 파싱 결과 사용
+    effective_addr = addr_keyword or counts.get("addr_keyword", "")
+    if effective_addr:
+        print(f"[네이버 검색] 동네명: '{effective_addr}' ({'수동입력' if addr_keyword else '자동파싱'})")
+    naver_cnt = crawl_naver_search_count(merchant_name, region, effective_addr)
 
     _write_progress("인스타그램 집계 중...", 91)
     ig_cnt = crawl_instagram_count(ig_tag)
