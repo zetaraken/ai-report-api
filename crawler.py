@@ -185,6 +185,28 @@ def make_mobile_browser(p):
 def get_official_counts(place_id):
     counts = {"receipt_total":0,"receipt_text_total":0,"receipt_keyword":0,"blog_total":0,"addr_keyword":""}
     try:
+        # 1단계: 네이버 플레이스 API로 지번주소 추출 (requests 사용 - 빠르고 정확)
+        import requests as req_lib
+        try:
+            api_url = f"https://pcmap-api.place.naver.com/place/graphql"
+            # 플레이스 홈 페이지에서 직접 파싱 (API 대신)
+            resp = req_lib.get(
+                f"https://pcmap.place.naver.com/restaurant/{place_id}/home",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                timeout=10
+            )
+            raw = resp.text
+            # 지번주소 패턴 탐색
+            jibun_m = re.search(r'"jibunAddress"\s*:\s*"([^"]+)"', raw)
+            if jibun_m:
+                jibun_addr = jibun_m.group(1)
+                dong_m = re.search(r'([가-힣]{2,5}(?:동|읍|면|리))\s+\d', jibun_addr)
+                if dong_m:
+                    counts["addr_keyword"] = dong_m.group(1)
+                    print(f"[주소 키워드] '{counts['addr_keyword']}' 추출 (API 지번)")
+        except Exception as e:
+            print(f"[주소 키워드] API 추출 실패: {e}")
+
         with sync_playwright() as p:
             browser, ctx = make_pc_browser(p)
 
@@ -200,40 +222,8 @@ def get_official_counts(place_id):
             if m1: counts["receipt_total"] = int(m1.group(1).replace(",",""))
             if m2: counts["blog_total"]    = int(m2.group(1).replace(",",""))
 
-            # 주소에서 검색 필터링용 동네명 추출
-            addr_kw = ""
-            html_home = page.content()
-
-            # 1순위: HTML에서 지번주소 파싱
-            dong_patterns = [
-                r'TjXg1[^>]*>지번</span>[^가-힣]*([가-힣]{2,5}(?:동|읍|면|리))\s*\d',
-                r'"jibunAddress"\s*:\s*"[^"]*?([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
-                r'지번[^가-힣]{0,30}([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
-                r'([가-힣]{2,5}(?:동|읍|면|리))\s+\d{2,4}-\d{1,4}',
-            ]
-            for pat in dong_patterns:
-                m = re.search(pat, html_home)
-                if m:
-                    addr_kw = m.group(1)
-                    print(f"[주소 키워드] '{addr_kw}' 추출 (HTML)")
-                    break
-
-            # 2순위: 꺽쇠 버튼 클릭 후 지번주소 읽기
-            if not addr_kw:
-                try:
-                    btn = page.locator('a[aria-haspopup="true"], button[aria-expanded]').first
-                    btn.click(timeout=3000)
-                    time.sleep(0.8)
-                    expanded_text = page.inner_text("body")
-                    m2 = re.search(r'지번[^가-힣]{0,30}([가-힣]{2,5}(?:동|읍|면|리))\s+\d', expanded_text)
-                    if m2:
-                        addr_kw = m2.group(1)
-                        print(f"[주소 키워드] '{addr_kw}' 추출 (클릭 후)")
-                except Exception as e:
-                    print(f"[주소 키워드] 클릭 시도 실패: {e}")
-
-            # 3순위: innerText에서 읍면동 추출
-            if not addr_kw:
+            # 주소 키워드가 아직 없으면 innerText에서 추가 시도
+            if not counts["addr_keyword"]:
                 dong_in_text = re.search(
                     r'(?:[가-힣]+시|[가-힣]+군)\s+'
                     r'(?:[가-힣]{2,5}(?:구|군)\s+)?'
@@ -242,13 +232,10 @@ def get_official_counts(place_id):
                     text
                 )
                 if dong_in_text:
-                    addr_kw = dong_in_text.group(1)
-                    print(f"[주소 키워드] '{addr_kw}' 추출 (텍스트)")
-
-            if not addr_kw:
-                print(f"[주소 키워드] 추출 실패 — region 폴백 사용")
-
-            counts["addr_keyword"] = addr_kw
+                    counts["addr_keyword"] = dong_in_text.group(1)
+                    print(f"[주소 키워드] '{counts['addr_keyword']}' 추출 (innerText)")
+                else:
+                    print(f"[주소 키워드] 추출 실패 — region 폴백 사용")
 
             page2 = ctx.new_page()
             page2.goto(f"https://pcmap.place.naver.com/restaurant/{place_id}/review/visitor",
@@ -696,12 +683,12 @@ def crawl_naver_search_count(merchant_name, region, addr_keyword=""):
             browser, ctx = make_pc_browser(p)
             page = ctx.new_page()
 
-            # 1차: 블로그 탭 — networkidle까지 대기 후 HTML 파싱
+            # 1차: 블로그 탭 — domcontentloaded 후 JS 렌더링 대기
             page.goto(
                 f"https://search.naver.com/search.naver?query={quote(query)}&where=blog",
-                wait_until="networkidle", timeout=25000
+                wait_until="domcontentloaded", timeout=25000
             )
-            time.sleep(2.5)
+            time.sleep(4.0)  # JS 렌더링 충분히 대기
 
             # HTML 원본에서 숫자 패턴 탐색
             html = page.content()
