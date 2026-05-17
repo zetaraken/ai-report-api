@@ -281,7 +281,7 @@ def crawl_receipt_reviews(place_id, target=500):
 
     # ── 세션 단위 크롤링 함수 ─────────────────────────────────
     # 브라우저 1회 실행당 최대 ROUNDS_PER_SESSION 라운드 수행
-    ROUNDS_PER_SESSION = 10  # 10라운드마다 재시작 (27라운드 hang 지점 원천 회피)
+    ROUNDS_PER_SESSION = 20  # 단일 세션 최대 라운드 (220건 목표에 충분)
 
     def run_session(session_num):
         """브라우저 새로 시작 → 최대 ROUNDS_PER_SESSION 라운드 수집 → 종료"""
@@ -381,7 +381,7 @@ def crawl_receipt_reviews(place_id, target=500):
 
                     if clicked:
                         no_btn_streak = 0
-                        wait_sec = human_sleep(2.0, 5.0)
+                        wait_sec = human_sleep(1.2, 2.5)
                         print(f"[영수증] JS 버튼 클릭 성공 ({clicked}) — {wait_sec:.1f}초 대기")
                     else:
                         no_btn_streak += 1

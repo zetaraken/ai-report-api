@@ -127,9 +127,9 @@ def crawl_merchant(job_id, merchant):
 
     upd(5, "플레이스 공식 리뷰 수 확인 중...")
 
-    # place_counts 먼저 파악 (target 계산용)
-    # crawler.py 내부에서 처리하므로 여기서는 기본값 사용
-    crawl_target = 500
+    # 영수증 리뷰 목표: 네이버 봇 감지로 인해 220건 이상 수집 불가
+    # 220건으로 확정 (광고 판별 분석에 충분한 샘플)
+    crawl_target = 220
     blog_target  = 100
 
     hb = threading.Thread(target=_heartbeat, daemon=True)
