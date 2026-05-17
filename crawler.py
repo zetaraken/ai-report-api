@@ -201,22 +201,25 @@ def get_official_counts(place_id):
             if m2: counts["blog_total"]    = int(m2.group(1).replace(",",""))
 
             # 주소에서 검색 필터링용 동네명 추출
-            # 전략: 도로명 전체(동탄기흥로257번가길)보다 동네명(방교동, 동탄)이
-            # 블로거 실제 작성 패턴과 일치하여 AND 검색 정확도가 높음
-            # 우선순위: 읍면동 > 시군구 > region 파라미터
+            # 네이버 플레이스 주소 형식:
+            #   지번: "경기 화성시 동탄구 방교동 771-4"  → 방교동
+            #   도로명: "경기 화성시 동탄구 동탄기흥로257번가길 24-11" → 동탄구
             addr_kw = ""
-
-            # 1순위: 읍면동 추출 (예: 방교동, 오산동, 능동)
-            dong_pattern = re.compile(r'([가-힣]{2,6}(?:동|읍|면|리))(?=\s|\d|$)')
-            # 제외할 일반 단어들
-            exclude_words = {"방문자동", "블로그동", "리뷰동", "키워드동", "별점동",
-                             "사진동", "영상동", "수집동", "분석동", "공식동"}
-            for m in dong_pattern.finditer(text):
-                cand = m.group(1).strip()
-                if cand not in exclude_words and len(cand) >= 3:
-                    addr_kw = cand
-                    print(f"[주소 키워드] 동네명 '{addr_kw}' 추출")
-                    break
+            addr_m = re.search(
+                r'(?:경기|서울|부산|대구|인천|광주|대전|울산|세종|강원|충북|충남|전북|전남|경북|경남|제주)'
+                r'\s+\S+시\s+(.*?)(?=\d|\n|\s{2,}|$)',
+                text
+            )
+            if addr_m:
+                addr_part = addr_m.group(1).strip()
+                dong_m = re.search(r'([가-힣]{2,6}(?:동|읍|면|리))', addr_part)
+                gu_m   = re.search(r'([가-힣]{2,5}(?:구|군))', addr_part)
+                if dong_m:
+                    addr_kw = dong_m.group(1)
+                    print(f"[주소 키워드] '{addr_kw}' 추출 (동네명)")
+                elif gu_m:
+                    addr_kw = gu_m.group(1)
+                    print(f"[주소 키워드] '{addr_kw}' 추출 (구명)")
 
             counts["addr_keyword"] = addr_kw
 
@@ -678,15 +681,15 @@ def crawl_naver_search_count(merchant_name, region, addr_keyword=""):
             text = page.inner_text("body")
 
             # 네이버 블로그 탭 총 건수 패턴들
+            # 주의: "totalCount" 같은 범용 JSON 키는 방문자리뷰 수 등과 혼동되므로 제외
             for pattern in [
-                r'약\s*([\d,]+)\s*개',
-                r'"totalCount"\s*:\s*(\d+)',       # JSON 데이터
-                r'total_count["\s:]+(\d+)',         # JS 변수
-                r'totalCount["\s:]+(\d+)',
-                r'<strong[^>]*>\s*([\d,]+)\s*</strong>\s*개',
-                r'([\d,]+)\s*개의?\s*검색결과',
-                r'검색결과\s*([\d,]+)',
-                r'결과\s*([\d,]+)\s*개',
+                r'약\s*([\d,]+)\s*개',                          # "약 1,234개"
+                r'<strong[^>]*>\s*([\d,]+)\s*</strong>\s*개',   # <strong>1,234</strong>개
+                r'([\d,]+)\s*개의?\s*검색결과',                  # "1,234개의 검색결과"
+                r'검색결과\s*([\d,]+)',                          # "검색결과 1,234"
+                r'결과\s*([\d,]+)\s*개',                        # "결과 1,234개"
+                r'"blogTotal"\s*:\s*(\d+)',                     # 블로그 전용 JSON 키
+                r'"blog_total"\s*:\s*(\d+)',
             ]:
                 # HTML에서 먼저 탐색
                 m = re.search(pattern, html)
