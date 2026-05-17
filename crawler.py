@@ -695,14 +695,16 @@ def crawl_naver_search_count(merchant_name, region, addr_keyword=""):
             html = page.content()
             text = page.inner_text("body")
 
-            # 디버그: 텍스트에서 숫자+개 패턴 주변 출력
+            # 디버그: 텍스트 전체 앞부분 출력
             print(f"[네이버 검색 디버그] 쿼리: {query}")
+            print(f"[네이버 검색 디버그] 텍스트길이: {len(text)}")
+            print(f"[네이버 검색 디버그] 앞500자: {repr(text[:500])}")
             for kw in ['개', '건', '결과']:
                 for mm in re.finditer(r'[\d,]{2,}\s*' + kw, text):
                     s = max(0, mm.start()-15)
                     e = min(len(text), mm.end()+15)
                     print(f"[네이버 검색 디버그] '{text[s:e].strip()}'")
-                    break  # 첫 번째만
+                    break
 
             # 네이버 블로그 탭 총 건수 패턴들
             # 주의: "totalCount" 같은 범용 JSON 키는 방문자리뷰 수 등과 혼동되므로 제외
