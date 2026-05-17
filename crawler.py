@@ -201,22 +201,36 @@ def get_official_counts(place_id):
             if m2: counts["blog_total"]    = int(m2.group(1).replace(",",""))
 
             # 주소에서 도로명 핵심 키워드 추출 (검색 필터링용)
-            # 예: "화성시 동탄기흥로257번가길 24-11" → "동탄기흥로257번가길"
+            # 실제 도로명 형식: 한글로시작 + 숫자혼합 + (로|대로|길) 로 끝나는 패턴
+            # 예: "동탄기흥로257번가길" "동탄대로14길" "동탄순환대로"
+            # 제외: "351블로그", "방문자리뷰" 등 숫자+한글 오탐 방지
             addr_kw = ""
-            for pat in [
-                r'(?:로|길|대로)\d*번?가?길?',         # 도로명 suffix 기준으로 앞부분까지 추출
-                r'(\S{3,}(?:로|대로|길)\S*)\s+\d+',   # 도로명+번지
-                r'(\S{3,}(?:로|대로|길)\S*)',          # 도로명만
-            ]:
-                m = re.search(r'(\S{2,}' + pat + r')', text)
-                if m:
-                    addr_kw = m.group(1).strip()
-                    # 너무 짧거나 일반 단어 제외
-                    if len(addr_kw) >= 5 and addr_kw not in ["도로명주소", "지번주소"]:
-                        print(f"[주소 키워드] '{addr_kw}' 추출")
-                        break
-                    else:
-                        addr_kw = ""
+            # 핵심 패턴: 한글로 시작하고 (로|대로|길)로 끝나는 단어
+            # 앞에 숫자가 오면 제외 (리뷰 수치 오탐 방지)
+            addr_pattern = re.compile(
+                r'(?<!\d)'                          # 앞에 숫자 없음
+                r'([가-힣]+\d*[가-힣]*\d*'          # 한글+숫자 혼합 시작
+                r'(?:로|대로|길)\d*번?가?길?)'       # (로|대로|길)로 끝남
+                r'(?=\s+\d|\s*$|\s+[가-힣])'        # 뒤에 번지수 or 공백
+            )
+            for m in addr_pattern.finditer(text):
+                cand = m.group(1).strip()
+                # 최소 4자 이상, 순수 한글만인 일반어 제외
+                if len(cand) >= 4 and re.search(r'\d', cand):
+                    addr_kw = cand
+                    print(f"[주소 키워드] '{addr_kw}' 추출")
+                    break
+
+            # 숫자 없는 도로명 폴백 (예: "동탄대로", "방교동길")
+            if not addr_kw:
+                addr_pattern2 = re.compile(
+                    r'(?<!\d)([가-힣]{3,}(?:로|대로|길))(?=\s+\d)'
+                )
+                m2 = addr_pattern2.search(text)
+                if m2:
+                    addr_kw = m2.group(1).strip()
+                    print(f"[주소 키워드] 폴백 '{addr_kw}' 추출")
+
             counts["addr_keyword"] = addr_kw
 
             page2 = ctx.new_page()
