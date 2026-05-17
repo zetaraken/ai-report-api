@@ -669,14 +669,14 @@ def crawl_naver_search_count(merchant_name, region, addr_keyword=""):
     - 2차: 통합검색 페이지 블로그 섹션 카운트
     - 3차: li.bx 노출 건수 폴백
     """
-    # 주소 도로명이 있으면 가장 정확한 AND 조건으로 검색
-    # 예: '"순자매감자탕" "동탄기흥로257번가길"'
+    # 큰따옴표 없이 키워드 나열 → 네이버가 AND로 처리
+    # 예: '순자매감자탕 방교동'
     if addr_keyword:
-        query = f'"{merchant_name}" "{addr_keyword}"'
+        query = f'{merchant_name} {addr_keyword}'
     elif region:
-        query = f'"{merchant_name}" "{region}"'
+        query = f'{merchant_name} {region}'
     else:
-        query = f'"{merchant_name}"'
+        query = merchant_name
     count = 0
     try:
         with sync_playwright() as p:
@@ -693,10 +693,6 @@ def crawl_naver_search_count(merchant_name, region, addr_keyword=""):
             # HTML 원본에서 숫자 패턴 탐색
             html = page.content()
             text = page.inner_text("body")
-
-            # 디버그: 실제 페이지 텍스트 확인 (처음 300자)
-            print(f"[네이버 검색 디버그] URL: search.naver.com?query={quote(query)}&where=blog")
-            print(f"[네이버 검색 디버그] 텍스트앞부분: {repr(text[:300])}")
 
             # 네이버 블로그 탭 총 건수 패턴들
             # 주의: "totalCount" 같은 범용 JSON 키는 방문자리뷰 수 등과 혼동되므로 제외
