@@ -201,22 +201,21 @@ def get_official_counts(place_id):
             if m2: counts["blog_total"]    = int(m2.group(1).replace(",",""))
 
             # 주소에서 검색 필터링용 동네명 추출
-            # 네이버 플레이스 홈 HTML에 도로명+지번 둘 다 포함됨
-            # page.content()로 HTML 원본을 가져와 지번주소에서 읍면동 추출
             addr_kw = ""
             html_home = page.content()
 
-            # HTML에서 지번주소 추출: "방교동 771-4" 형태
-            # 지번주소는 HTML 속성값이나 JSON 데이터로 포함됨
+            # 네이버 플레이스 HTML 실제 구조:
+            # <span class="TjXg1">지번</span>"경기 화성시 동탄구 방교동 771-4"
             dong_patterns = [
-                # JSON 형태: "jibunAddress":"경기 화성시 동탄구 방교동 771-4"
+                # 실제 확인된 패턴: TjXg1 클래스 span 다음 지번주소 텍스트
+                r'TjXg1[^>]*>지번</span>\s*"?경기[^"]*?([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
+                r'TjXg1[^>]*>지번</span>[^가-힣]{0,30}([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
+                # JSON 형태
                 r'"jibunAddress"\s*:\s*"[^"]*?([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
-                # JSON 형태: "address":"... 방교동 ..."
-                r'"address"\s*:\s*"[^"]*?([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
-                # 일반 텍스트: 지번 ... 방교동 771
-                r'지번[^가-힣]{0,10}([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
-                # HTML 속성: data-jibun="방교동 771-4"
-                r'jibun[^"]*"[^"]*?([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
+                # 지번 텍스트 기반
+                r'지번[^가-힣]{0,20}([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
+                # 지번 형식 (동명 + 번지)
+                r'([가-힣]{2,5}(?:동|읍|면|리))\s+\d{2,4}-\d{1,4}',
             ]
             for pat in dong_patterns:
                 m = re.search(pat, html_home)
@@ -225,7 +224,7 @@ def get_official_counts(place_id):
                     print(f"[주소 키워드] '{addr_kw}' 추출 (HTML 지번)")
                     break
 
-            # 폴백: innerText에서 읍면동 추출 시도
+            # 폴백: innerText에서 읍면동 추출
             if not addr_kw:
                 dong_in_text = re.search(
                     r'(?:[가-힣]+시|[가-힣]+군)\s+'
@@ -237,6 +236,9 @@ def get_official_counts(place_id):
                 if dong_in_text:
                     addr_kw = dong_in_text.group(1)
                     print(f"[주소 키워드] '{addr_kw}' 추출 (텍스트)")
+
+            if not addr_kw:
+                print(f"[주소 키워드] 추출 실패 — region 폴백 사용")
 
             if not addr_kw:
                 print(f"[주소 키워드] 추출 실패 — region 폴백 사용")
@@ -696,40 +698,9 @@ def crawl_naver_search_count(merchant_name, region, addr_keyword=""):
             )
             time.sleep(2.5)
 
-            # HTML 원본에서 숫자 패턴 탐색 (innerText보다 정확)
+            # HTML 원본에서 숫자 패턴 탐색
             html = page.content()
             text = page.inner_text("body")
-
-            # 0차: JS로 네이버 내부 데이터에서 직접 추출
-            try:
-                js_count = page.evaluate("""() => {
-                    // 네이버 블로그 탭 total count를 JS 변수에서 직접 읽기
-                    try {
-                        // 방법1: __NEXT_DATA__ 내 blogTotal
-                        const nd = window.__NEXT_DATA__;
-                        if (nd) {
-                            const s = JSON.stringify(nd);
-                            const m = s.match(/"blogTotal":(\d+)/);
-                            if (m) return parseInt(m[1]);
-                            const m2 = s.match(/"total":(\d+)/);
-                            if (m2) return parseInt(m2[1]);
-                        }
-                    } catch(e) {}
-                    try {
-                        // 방법2: 페이지 내 script 태그에서 숫자 패턴
-                        const scripts = document.querySelectorAll('script');
-                        for (const s of scripts) {
-                            const m = s.textContent.match(/"total"\s*:\s*(\d{2,})/);
-                            if (m && parseInt(m[1]) > 5) return parseInt(m[1]);
-                        }
-                    } catch(e) {}
-                    return 0;
-                }""")
-                if js_count and js_count > 5:
-                    count = js_count
-                    print(f"[네이버 검색] JS 추출: {count}건")
-            except Exception as e:
-                print(f"[네이버 검색] JS 추출 오류: {e}")
 
             # 네이버 블로그 탭 총 건수 패턴들
             # 주의: "totalCount" 같은 범용 JSON 키는 방문자리뷰 수 등과 혼동되므로 제외
