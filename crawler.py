@@ -220,207 +220,175 @@ def get_official_counts(place_id):
 
 
 # ════════════════════════════════════════════════════════════
-# STEP 1: 영수증(방문자) 리뷰  v35
-# 핵심 변경: 20라운드마다 브라우저 완전 재시작
-#   - Playwright DOM 누적 hang 원천 차단
-#   - seen_texts로 중복 리뷰 필터링 (재시작 후에도 이어서 수집)
-#   - 재시작 시 스크롤을 빠르게 내려서 새 리뷰 위치로 이동
+# STEP 1: 영수증(방문자) 리뷰  v42
+# Playwright → Selenium 전환 + BeautifulSoup 파싱
+# Selenium은 Playwright와 봇 감지 패턴이 달라 차단 우회 가능성 높음
 # ════════════════════════════════════════════════════════════
 def crawl_receipt_reviews(place_id, target=500):
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.chrome.options import Options
+    from bs4 import BeautifulSoup
+
     reviews = []
     seen_texts = set()
 
-    JS_COLLECT = """
-        () => {
-            const SKIP = new Set(['펼쳐서 더보기','더보기','반응 남기기','좋아요','신고','접기']);
-            const r = [];
-            document.querySelectorAll('div.pui__vn15t2').forEach(el => {
-                if (el.dataset.collected === '1') return;
-                let t = (el.innerText || '').trim();
-                SKIP.forEach(s => { t = t.replace(s, '').trim(); });
-                if (t.length >= 10) { r.push(t); el.dataset.collected = '1'; }
-            });
-            if (!r.length) {
-                document.querySelectorAll('li.pui__X35jYm, li[class*="pui__X35jYm"]').forEach(li => {
-                    if (li.dataset.collected === '1') return;
-                    let t = (li.innerText || '').trim();
-                    SKIP.forEach(s => { t = t.replace(s, '').trim(); });
-                    if (t.length >= 10) { r.push(t); li.dataset.collected = '1'; }
-                });
-            }
-            return r;
-        }
-    """
-    JS_CLICK_BTN = """
-        () => {
-            const byText = [...document.querySelectorAll('a, button, span')].find(
-                el => (el.innerText || '').trim().includes('펼쳐서 더보기')
-            );
-            if (byText) { byText.click(); return 'text'; }
-            const byClass = document.querySelector('a.fvwqf, a.place_bluelink');
-            if (byClass) { byClass.click(); return 'class'; }
-            return null;
-        }
-    """
-    JS_REMOVE = """
-        () => {
-            let cnt = 0;
-            document.querySelectorAll(
-                'li.pui__X35jYm[data-collected="1"], li[class*="pui__X35jYm"][data-collected="1"]'
-            ).forEach(li => {
-                try { li.parentNode && li.parentNode.removeChild(li); cnt++; } catch(e) {}
-            });
-            document.querySelectorAll('div.pui__vn15t2[data-collected="1"]').forEach(div => {
-                try { div.parentNode && div.parentNode.removeChild(div); cnt++; } catch(e) {}
-            });
-            return cnt;
-        }
-    """
+    def make_driver():
+        opts = Options()
+        opts.add_argument("--headless")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=390,844")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        opts.add_argument(
+            "user-agent=Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/16.6 Mobile/15E148 Safari/604.1"
+        )
+        driver = webdriver.Chrome(options=opts)
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"}
+        )
+        driver.get("https://www.naver.com")
+        for c in NAVER_COOKIES:
+            try:
+                driver.add_cookie({
+                    "name": c["name"], "value": c["value"],
+                    "domain": c.get("domain", ".naver.com"), "path": "/"
+                })
+            except Exception:
+                pass
+        if NAVER_COOKIES:
+            print(f"[영수증] Selenium 쿠키 {len(NAVER_COOKIES)}개 주입")
+        return driver
 
-    mobile_url = f"https://m.place.naver.com/restaurant/{place_id}/review/visitor?entry=ple&reviewSort=recent"
+    def collect_from_html(html):
+        soup = BeautifulSoup(html, "html.parser")
+        texts = []
+        SKIP = {"펼쳐서 더보기","더보기","반응 남기기","좋아요","신고","접기"}
+        for el in soup.select("div.pui__vn15t2"):
+            t = el.get_text(strip=True)
+            for s in SKIP: t = t.replace(s, "").strip()
+            if len(t) >= 10:
+                texts.append(t)
+        if not texts:
+            for li in soup.select("li.pui__X35jYm"):
+                t = li.get_text(strip=True)
+                for s in SKIP: t = t.replace(s, "").strip()
+                if len(t) >= 10:
+                    texts.append(t)
+        return texts
 
-    # ── 세션 단위 크롤링 함수 ─────────────────────────────────
-    # 브라우저 1회 실행당 최대 ROUNDS_PER_SESSION 라운드 수행
-    ROUNDS_PER_SESSION = 20  # 단일 세션 최대 라운드 (220건 목표에 충분)
-
-    def run_session(session_num):
-        """브라우저 새로 시작 → 최대 ROUNDS_PER_SESSION 라운드 수집 → 종료"""
-        nonlocal reviews, seen_texts
-        collected_this_session = 0
-
-        print(f"[영수증] ▶ 세션 {session_num} 시작 (현재 누적 {len(reviews)}건)")
+    def sel_scroll(driver, steps=5):
         try:
-            with sync_playwright() as p:
-                browser, ctx = make_mobile_browser(p)
-                page = ctx.new_page()
-                page.set_default_timeout(15000)
-                page.goto(mobile_url, wait_until="domcontentloaded", timeout=30000)
-                time.sleep(3.0)
+            total = driver.execute_script("return document.body.scrollHeight")
+            current = driver.execute_script("return window.scrollY")
+            step = max((total - current) // steps, 100)
+            for i in range(steps):
+                driver.execute_script(f"window.scrollTo(0, {current + step * (i+1)})")
+                time.sleep(random.uniform(0.2, 0.5))
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(random.uniform(0.3, 0.6))
+        except Exception:
+            pass
 
-                body_text = page.inner_text("body")
-                if not (len(body_text) > 300 and any(kw in body_text for kw in ["리뷰","별점","방문","음식"])):
-                    print(f"[영수증] 세션 {session_num}: 페이지 유효하지 않음")
-                    browser.close()
-                    return False  # 재시도 필요
+    url = f"https://m.place.naver.com/restaurant/{place_id}/review/visitor?entry=ple&reviewSort=recent"
+    print(f"[영수증] Selenium v42 시작: {url}")
+    driver = None
+    try:
+        driver = make_driver()
+        driver.get(url)
+        time.sleep(4.0)
 
-                # 세션 번호에 따라 최대 라운드 동적 조정
-                # 세션2 이후엔 중복 구간을 통과해야 하므로 더 많은 라운드 필요
-                max_rounds_this_session = ROUNDS_PER_SESSION + (session_num - 1) * ROUNDS_PER_SESSION
-                print(f"[영수증] 세션 {session_num} 최대 라운드: {max_rounds_this_session}")
+        body = driver.find_element(By.TAG_NAME, "body").text
+        if len(body) < 300 or not any(kw in body for kw in ["리뷰","별점","방문","음식"]):
+            print("[영수증] 페이지 유효하지 않음")
+            raise Exception("invalid page")
 
-                # 세션 시작 → 바로 수집 (스킵 없음, seen_texts가 중복 차단)
-                # 실제 수집 라운드
-                round_num = 0
+        round_num = 0
+        zero_streak = 0
+        no_btn_streak = 0
+
+        while round_num < 30:
+            round_num += 1
+            sel_scroll(driver, steps=random.randint(4, 7))
+
+            raw = collect_from_html(driver.page_source)
+            new_count = 0
+            for t in raw:
+                t = t.strip()
+                if len(t) >= 10 and t not in seen_texts:
+                    seen_texts.add(t)
+                    ad_type = classify_ad(t)
+                    reviews.append({
+                        "text": t[:500], "ad_type": ad_type,
+                        "ad_basis": get_basis(t, ad_type), "source": "naver_receipt",
+                    })
+                    new_count += 1
+                elif len(t) >= 10:
+                    seen_texts.add(t)
+
+            current = len(reviews)
+            print(f"[영수증] 라운드 {round_num}: +{new_count}건 → 누적 {current}건")
+            _write_progress(
+                f"영수증리뷰 수집 중... ({current}건 / 목표 {target}건, {round_num}라운드)",
+                10 + int((min(current, target) / max(target, 1)) * 28)
+            )
+
+            if current >= target:
+                print(f"[영수증] 목표 달성: {current}건")
+                break
+
+            texts_found = len([t for t in raw if len(t.strip()) >= 10])
+            if texts_found == 0:
+                zero_streak += 1
+                if zero_streak >= 5:
+                    print("[영수증] 텍스트 없음 5회 연속 → 종료")
+                    break
+            else:
                 zero_streak = 0
+
+            clicked = False
+            try:
+                btn = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, "//*[contains(text(),'펼쳐서 더보기')]"))
+                )
+                driver.execute_script("arguments[0].click();", btn)
+                clicked = True
+                wait_sec = random.uniform(1.2, 2.5)
+                print(f"[영수증] 버튼 클릭 — {wait_sec:.1f}초 대기")
+                time.sleep(wait_sec)
+            except Exception:
+                pass
+
+            if not clicked:
+                no_btn_streak += 1
+                print(f"[영수증] 버튼 없음 (연속 {no_btn_streak}회)")
+                if no_btn_streak >= 3:
+                    print("[영수증] 버튼 3회 연속 미발견 → 종료")
+                    break
+                for _ in range(3):
+                    sel_scroll(driver, steps=random.randint(3, 5))
+                    time.sleep(random.uniform(0.4, 0.8))
+            else:
                 no_btn_streak = 0
 
-                while round_num < max_rounds_this_session:
-                    round_num += 1
-
-                    # ① 사람처럼 조금씩 스크롤
-                    human_scroll(page, steps=random.randint(4, 7))
-
-                    try:
-                        texts = page.evaluate(JS_COLLECT)
-                    except Exception as e:
-                        print(f"[영수증] 세션 {session_num} 수집 오류: {e}")
-                        break
-
-                    new_count = 0
-                    for text in (texts or []):
-                        t = text.strip()
-                        if len(t) >= 10 and t not in seen_texts:
-                            seen_texts.add(t)
-                            ad_type = classify_ad(t)
-                            reviews.append({
-                                "text": t[:500],
-                                "ad_type": ad_type,
-                                "ad_basis": get_basis(t, ad_type),
-                                "source": "naver_receipt",
-                            })
-                            new_count += 1
-                            collected_this_session += 1
-                        elif len(t) >= 10:
-                            seen_texts.add(t)  # 중복이어도 seen_texts에 등록
-
-                    current = len(reviews)
-                    global_round = (session_num - 1) * ROUNDS_PER_SESSION + round_num
-                    dup_count = len([t for t in (texts or []) if len(t.strip()) >= 10]) - new_count
-                    print(f"[영수증] 세션{session_num} 라운드{round_num}(전체{global_round}): +{new_count}건(중복{dup_count}건) → 누적 {current}건")
-
-                    _write_progress(
-                        f"영수증리뷰 수집 중... ({current}건 / 목표 {target}건, 세션{session_num}-{round_num}라운드)",
-                        10 + int((min(current, target) / max(target, 1)) * 28)
-                    )
-
-                    if current >= target:
-                        print(f"[영수증] 목표 달성: {current}건")
-                        browser.close()
-                        return True  # 완료
-
-                    # zero_streak: 텍스트 자체가 없을 때만 누적
-                    # 중복으로 걸러진 경우(dup_count > 0)는 아직 읽을 리뷰가 있는 것
-                    texts_found = len([t for t in (texts or []) if len(t.strip()) >= 10])
-                    if texts_found == 0:
-                        zero_streak += 1
-                        if zero_streak >= 5:
-                            print(f"[영수증] 텍스트 없음 5회 연속 → 세션 종료")
-                            break
-                        if zero_streak >= 3:
-                            for _ in range(6):
-                                human_scroll(page, steps=random.randint(3, 6))
-                                time.sleep(random.uniform(0.3, 0.7))
-                    else:
-                        zero_streak = 0  # 중복이든 신규든 텍스트가 있으면 리셋
-
-                    try:
-                        clicked = page.evaluate(JS_CLICK_BTN)
-                    except Exception as e:
-                        print(f"[영수증] 세션 {session_num} 클릭 오류: {e}")
-                        break
-
-                    if clicked:
-                        no_btn_streak = 0
-                        wait_sec = human_sleep(1.2, 2.5)
-                        print(f"[영수증] JS 버튼 클릭 성공 ({clicked}) — {wait_sec:.1f}초 대기")
-                    else:
-                        no_btn_streak += 1
-                        if no_btn_streak >= 3:
-                            print("[영수증] 버튼 3회 연속 미발견 → 세션 종료")
-                            break
-                        for _ in range(3):
-                            human_scroll(page, steps=random.randint(3, 5))
-                            time.sleep(random.uniform(0.3, 0.8))
-
-                    if round_num % 5 == 0:
-                        try:
-                            removed = page.evaluate(JS_REMOVE)
-                            print(f"[영수증] DOM 정리: {removed}개 제거")
-                        except Exception:
-                            pass
-
-                browser.close()
-                print(f"[영수증] 세션 {session_num} 완료: +{collected_this_session}건")
-                return collected_this_session > 0  # 수집된 게 있으면 다음 세션 계속
-
-        except Exception as e:
-            print(f"[영수증] 세션 {session_num} 오류: {e}")
-            return len(reviews) > 0
-
-    # ── 세션 반복 실행 ────────────────────────────────────────
-    MAX_SESSIONS = 10
-    for session_num in range(1, MAX_SESSIONS + 1):
-        done = run_session(session_num)
-        if len(reviews) >= target:
-            print(f"[영수증] 목표 달성으로 종료")
-            break
-        if not done:
-            print(f"[영수증] 세션 {session_num} 수집 없음 → 종료")
-            break
+    except Exception as e:
+        print(f"[영수증] Selenium 오류: {e}")
+    finally:
+        if driver:
+            try: driver.quit()
+            except: pass
 
     print(f"[영수증] 최종: {len(reviews)}건")
     return reviews
-
 
 # ════════════════════════════════════════════════════════════
 # STEP 2: 블로그 링크 수집
