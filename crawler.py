@@ -694,6 +694,10 @@ def crawl_naver_search_count(merchant_name, region, addr_keyword=""):
             html = page.content()
             text = page.inner_text("body")
 
+            # 디버그: 실제 페이지 텍스트 확인 (처음 300자)
+            print(f"[네이버 검색 디버그] URL: search.naver.com?query={quote(query)}&where=blog")
+            print(f"[네이버 검색 디버그] 텍스트앞부분: {repr(text[:300])}")
+
             # 네이버 블로그 탭 총 건수 패턴들
             # 주의: "totalCount" 같은 범용 JSON 키는 방문자리뷰 수 등과 혼동되므로 제외
             for pattern in [
