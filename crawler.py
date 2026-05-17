@@ -1,12 +1,19 @@
 """
-crawler.py - SNS 분석 독립 크롤러 v34
+crawler.py - SNS 분석 독립 크롤러 v40
 subprocess로 실행되어 greenlet 충돌을 원천 차단.
 결과는 JSON 파일로 저장.
+
+v40 변경사항:
+  1. 클릭 간격 랜덤화: 1.2초 고정 → 2~5초 랜덤
+  2. 스크롤 자연화: 한 번에 맨 아래가 아니라 조금씩 내리기
+  3. 네이버 로그인 쿠키 주입: 환경변수 NAVER_COOKIES에서 읽어서 Playwright에 주입
 
 실행: python crawler.py <place_id> <merchant_name> <region> <ig_tag> <crawl_target> <blog_target> <output_path>
 """
 
 import json
+import os
+import random
 import re
 import sys
 import time
@@ -14,6 +21,70 @@ from pathlib import Path
 from urllib.parse import quote
 
 from playwright.sync_api import sync_playwright
+
+
+# ── 네이버 쿠키 로드 ──────────────────────────────────────────────
+# Railway 환경변수 NAVER_COOKIES에 JSON 배열로 저장
+# 예: [{"name":"NID_AUT","value":"xxx","domain":".naver.com"},...]
+def load_naver_cookies():
+    raw = os.environ.get("NAVER_COOKIES", "")
+    if not raw:
+        print("[쿠키] NAVER_COOKIES 환경변수 없음 → 비로그인 모드")
+        return []
+    try:
+        cookies = json.loads(raw)
+        print(f"[쿠키] 네이버 쿠키 {len(cookies)}개 로드 성공")
+        return cookies
+    except Exception as e:
+        print(f"[쿠키] 파싱 오류: {e}")
+        return []
+
+NAVER_COOKIES = load_naver_cookies()
+
+
+# ── 사람처럼 동작하는 헬퍼 함수 ──────────────────────────────────
+def human_sleep(min_sec=2.0, max_sec=5.0):
+    """랜덤 대기 — 봇 감지 회피"""
+    t = random.uniform(min_sec, max_sec)
+    time.sleep(t)
+    return t
+
+def human_scroll(page, steps=5):
+    """조금씩 나눠서 스크롤 — 사람처럼"""
+    try:
+        total_height = page.evaluate("document.body.scrollHeight")
+        current = page.evaluate("window.scrollY")
+        step_size = max((total_height - current) // steps, 100)
+        for i in range(steps):
+            next_pos = current + step_size * (i + 1)
+            page.evaluate(f"window.scrollTo(0, {next_pos})")
+            time.sleep(random.uniform(0.15, 0.4))
+        # 마지막엔 맨 아래
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(random.uniform(0.2, 0.5))
+    except Exception:
+        pass
+
+def inject_cookies(ctx):
+    """Playwright 컨텍스트에 네이버 쿠키 주입"""
+    if not NAVER_COOKIES:
+        return
+    try:
+        formatted = []
+        for c in NAVER_COOKIES:
+            cookie = {
+                "name":   c.get("name", ""),
+                "value":  c.get("value", ""),
+                "domain": c.get("domain", ".naver.com"),
+                "path":   c.get("path", "/"),
+            }
+            if c.get("secure"): cookie["secure"] = True
+            if c.get("httpOnly"): cookie["httpOnly"] = True
+            formatted.append(cookie)
+        ctx.add_cookies(formatted)
+        print(f"[쿠키] {len(formatted)}개 주입 완료")
+    except Exception as e:
+        print(f"[쿠키] 주입 오류: {e}")
 
 
 # ── 광고 판별 ─────────────────────────────────────────────────────
@@ -68,6 +139,7 @@ def make_pc_browser(p):
         viewport={"width": 1920, "height": 1080},
         locale="ko-KR",
     )
+    inject_cookies(ctx)
     return browser, ctx
 
 def make_mobile_browser(p):
@@ -84,6 +156,7 @@ def make_mobile_browser(p):
         viewport={"width": 390, "height": 844},
         locale="ko-KR",
     )
+    inject_cookies(ctx)
     return browser, ctx
 
 
@@ -229,12 +302,8 @@ def crawl_receipt_reviews(place_id, target=500):
                 while round_num < max_rounds_this_session:
                     round_num += 1
 
-                    for _ in range(4):
-                        try:
-                            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            time.sleep(0.25)
-                        except Exception:
-                            pass
+                    # ① 사람처럼 조금씩 스크롤
+                    human_scroll(page, steps=random.randint(4, 7))
 
                     try:
                         texts = page.evaluate(JS_COLLECT)
@@ -284,11 +353,8 @@ def crawl_receipt_reviews(place_id, target=500):
                             break
                         if zero_streak >= 3:
                             for _ in range(6):
-                                try:
-                                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                                    time.sleep(0.4)
-                                except Exception:
-                                    pass
+                                human_scroll(page, steps=random.randint(3, 6))
+                                time.sleep(random.uniform(0.3, 0.7))
                     else:
                         zero_streak = 0  # 중복이든 신규든 텍스트가 있으면 리셋
 
@@ -300,19 +366,16 @@ def crawl_receipt_reviews(place_id, target=500):
 
                     if clicked:
                         no_btn_streak = 0
-                        print(f"[영수증] JS 버튼 클릭 성공 ({clicked})")
-                        time.sleep(1.2)
+                        wait_sec = human_sleep(2.0, 5.0)
+                        print(f"[영수증] JS 버튼 클릭 성공 ({clicked}) — {wait_sec:.1f}초 대기")
                     else:
                         no_btn_streak += 1
                         if no_btn_streak >= 3:
                             print("[영수증] 버튼 3회 연속 미발견 → 세션 종료")
                             break
                         for _ in range(3):
-                            try:
-                                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                                time.sleep(0.4)
-                            except Exception:
-                                pass
+                            human_scroll(page, steps=random.randint(3, 5))
+                            time.sleep(random.uniform(0.3, 0.8))
 
                     if round_num % 5 == 0:
                         try:
