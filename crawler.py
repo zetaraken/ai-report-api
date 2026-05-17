@@ -201,25 +201,33 @@ def get_official_counts(place_id):
             if m2: counts["blog_total"]    = int(m2.group(1).replace(",",""))
 
             # 주소에서 검색 필터링용 동네명 추출
-            # 네이버 플레이스 주소 형식:
-            #   지번: "경기 화성시 동탄구 방교동 771-4"  → 방교동
-            #   도로명: "경기 화성시 동탄구 동탄기흥로257번가길 24-11" → 동탄구
+            # 네이버 플레이스 홈 텍스트에 주소가 여러 형식으로 노출됨
+            # 전략: 시/군/구 뒤에 나오는 읍면동을 직접 추출 (가장 신뢰도 높음)
             addr_kw = ""
-            addr_m = re.search(
-                r'(?:경기|서울|부산|대구|인천|광주|대전|울산|세종|강원|충북|충남|전북|전남|경북|경남|제주)'
-                r'\s+\S+시\s+(.*?)(?=\d|\n|\s{2,}|$)',
+
+            # 1순위: "시 ... 동|읍|면|리" 패턴 — 주소 맥락에서 읍면동 추출
+            # 예: "화성시 동탄구 방교동" → 방교동
+            # 예: "화성시 오산동" → 오산동
+            dong_in_addr = re.search(
+                r'(?:[가-힣]+시|[가-힣]+군)\s+'
+                r'(?:[가-힣]{2,5}(?:구|군)\s+)?'
+                r'([가-힣]{1,5}(?:동|읍|면|리))'
+                r'(?=\s*\d)',
                 text
             )
-            if addr_m:
-                addr_part = addr_m.group(1).strip()
-                dong_m = re.search(r'([가-힣]{2,6}(?:동|읍|면|리))', addr_part)
-                gu_m   = re.search(r'([가-힣]{2,5}(?:구|군))', addr_part)
-                if dong_m:
-                    addr_kw = dong_m.group(1)
-                    print(f"[주소 키워드] '{addr_kw}' 추출 (동네명)")
-                elif gu_m:
-                    addr_kw = gu_m.group(1)
-                    print(f"[주소 키워드] '{addr_kw}' 추출 (구명)")
+            if dong_in_addr:
+                addr_kw = dong_in_addr.group(1)
+                print(f"[주소 키워드] '{addr_kw}' 추출 (읍면동)")
+
+            # 2순위: 읍면동 못 찾으면 구/군명 사용
+            if not addr_kw:
+                gu_in_addr = re.search(
+                    r'(?:[가-힣]+시)\s+([가-힣]{2,5}(?:구|군))(?=\s)',
+                    text
+                )
+                if gu_in_addr:
+                    addr_kw = gu_in_addr.group(1)
+                    print(f"[주소 키워드] '{addr_kw}' 추출 (구/군명)")
 
             counts["addr_keyword"] = addr_kw
 
