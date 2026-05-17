@@ -183,7 +183,7 @@ def make_mobile_browser(p):
 # STEP 0: 공식 리뷰 수
 # ════════════════════════════════════════════════════════════
 def get_official_counts(place_id):
-    counts = {"receipt_total":0,"receipt_text_total":0,"receipt_keyword":0,"blog_total":0}
+    counts = {"receipt_total":0,"receipt_text_total":0,"receipt_keyword":0,"blog_total":0,"addr_keyword":""}
     try:
         with sync_playwright() as p:
             browser, ctx = make_pc_browser(p)
@@ -199,6 +199,25 @@ def get_official_counts(place_id):
             m2 = re.search(r'블로그\s*리뷰\s*([\d,]+)', text)
             if m1: counts["receipt_total"] = int(m1.group(1).replace(",",""))
             if m2: counts["blog_total"]    = int(m2.group(1).replace(",",""))
+
+            # 주소에서 도로명 핵심 키워드 추출 (검색 필터링용)
+            # 예: "화성시 동탄기흥로257번가길 24-11" → "동탄기흥로257번가길"
+            addr_kw = ""
+            for pat in [
+                r'(?:로|길|대로)\d*번?가?길?',         # 도로명 suffix 기준으로 앞부분까지 추출
+                r'(\S{3,}(?:로|대로|길)\S*)\s+\d+',   # 도로명+번지
+                r'(\S{3,}(?:로|대로|길)\S*)',          # 도로명만
+            ]:
+                m = re.search(r'(\S{2,}' + pat + r')', text)
+                if m:
+                    addr_kw = m.group(1).strip()
+                    # 너무 짧거나 일반 단어 제외
+                    if len(addr_kw) >= 5 and addr_kw not in ["도로명주소", "지번주소"]:
+                        print(f"[주소 키워드] '{addr_kw}' 추출")
+                        break
+                    else:
+                        addr_kw = ""
+            counts["addr_keyword"] = addr_kw
 
             page2 = ctx.new_page()
             page2.goto(f"https://pcmap.place.naver.com/restaurant/{place_id}/review/visitor",
@@ -623,14 +642,23 @@ def classify_blog_originals(blog_links):
 # ════════════════════════════════════════════════════════════
 # STEP 4: 네이버 검색 수
 # ════════════════════════════════════════════════════════════
-def crawl_naver_search_count(merchant_name, region):
+def crawl_naver_search_count(merchant_name, region, addr_keyword=""):
     """
     네이버 블로그 검색 총 건수 수집.
+    - 쿼리: "가맹점명" "도로명" 형태로 주소 기반 AND 필터링
+    - 도로명 없을 시: "가맹점명" "지역명" 폴백
     - 1차: 블로그 탭 HTML 원본에서 숫자 직접 추출
     - 2차: 통합검색 페이지 블로그 섹션 카운트
-    - 3차: requests 직접 호출 (JS 불필요한 초기 HTML)
+    - 3차: li.bx 노출 건수 폴백
     """
-    query = f"{region} {merchant_name}".strip()
+    # 주소 도로명이 있으면 가장 정확한 AND 조건으로 검색
+    # 예: '"순자매감자탕" "동탄기흥로257번가길"'
+    if addr_keyword:
+        query = f'"{merchant_name}" "{addr_keyword}"'
+    elif region:
+        query = f'"{merchant_name}" "{region}"'
+    else:
+        query = f'"{merchant_name}"'
     count = 0
     try:
         with sync_playwright() as p:
@@ -818,7 +846,7 @@ if __name__ == "__main__":
     blog_reviews = classify_blog_originals(blog_links)
 
     _write_progress("네이버 검색결과 집계 중...", 80)
-    naver_cnt = crawl_naver_search_count(merchant_name, region)
+    naver_cnt = crawl_naver_search_count(merchant_name, region, counts.get("addr_keyword", ""))
 
     _write_progress("인스타그램 집계 중...", 91)
     ig_cnt = crawl_instagram_count(ig_tag)
