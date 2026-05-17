@@ -200,36 +200,23 @@ def get_official_counts(place_id):
             if m1: counts["receipt_total"] = int(m1.group(1).replace(",",""))
             if m2: counts["blog_total"]    = int(m2.group(1).replace(",",""))
 
-            # 주소에서 도로명 핵심 키워드 추출 (검색 필터링용)
-            # 실제 도로명 형식: 한글로시작 + 숫자혼합 + (로|대로|길) 로 끝나는 패턴
-            # 예: "동탄기흥로257번가길" "동탄대로14길" "동탄순환대로"
-            # 제외: "351블로그", "방문자리뷰" 등 숫자+한글 오탐 방지
+            # 주소에서 검색 필터링용 동네명 추출
+            # 전략: 도로명 전체(동탄기흥로257번가길)보다 동네명(방교동, 동탄)이
+            # 블로거 실제 작성 패턴과 일치하여 AND 검색 정확도가 높음
+            # 우선순위: 읍면동 > 시군구 > region 파라미터
             addr_kw = ""
-            # 핵심 패턴: 한글로 시작하고 (로|대로|길)로 끝나는 단어
-            # 앞에 숫자가 오면 제외 (리뷰 수치 오탐 방지)
-            addr_pattern = re.compile(
-                r'(?<!\d)'                          # 앞에 숫자 없음
-                r'([가-힣]+\d*[가-힣]*\d*'          # 한글+숫자 혼합 시작
-                r'(?:로|대로|길)\d*번?가?길?)'       # (로|대로|길)로 끝남
-                r'(?=\s+\d|\s*$|\s+[가-힣])'        # 뒤에 번지수 or 공백
-            )
-            for m in addr_pattern.finditer(text):
-                cand = m.group(1).strip()
-                # 최소 4자 이상, 순수 한글만인 일반어 제외
-                if len(cand) >= 4 and re.search(r'\d', cand):
-                    addr_kw = cand
-                    print(f"[주소 키워드] '{addr_kw}' 추출")
-                    break
 
-            # 숫자 없는 도로명 폴백 (예: "동탄대로", "방교동길")
-            if not addr_kw:
-                addr_pattern2 = re.compile(
-                    r'(?<!\d)([가-힣]{3,}(?:로|대로|길))(?=\s+\d)'
-                )
-                m2 = addr_pattern2.search(text)
-                if m2:
-                    addr_kw = m2.group(1).strip()
-                    print(f"[주소 키워드] 폴백 '{addr_kw}' 추출")
+            # 1순위: 읍면동 추출 (예: 방교동, 오산동, 능동)
+            dong_pattern = re.compile(r'([가-힣]{2,6}(?:동|읍|면|리))(?=\s|\d|$)')
+            # 제외할 일반 단어들
+            exclude_words = {"방문자동", "블로그동", "리뷰동", "키워드동", "별점동",
+                             "사진동", "영상동", "수집동", "분석동", "공식동"}
+            for m in dong_pattern.finditer(text):
+                cand = m.group(1).strip()
+                if cand not in exclude_words and len(cand) >= 3:
+                    addr_kw = cand
+                    print(f"[주소 키워드] 동네명 '{addr_kw}' 추출")
+                    break
 
             counts["addr_keyword"] = addr_kw
 
