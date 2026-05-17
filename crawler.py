@@ -492,6 +492,47 @@ def classify_blog_originals(blog_links):
                     page.goto(url, wait_until="domcontentloaded", timeout=8000)
                     time.sleep(0.8)
 
+                    # ── 협찬 배지 HTML 감지 (텍스트로 안 잡히는 이미지형 배지) ──
+                    # 네이버 블로그 #협찬 배지: 특정 클래스/속성으로 렌더링됨
+                    is_sponsored_badge = False
+                    try:
+                        html_source = page.content()
+                        # 협찬 배지 관련 HTML 패턴들
+                        sponsored_patterns = [
+                            "se-oglink-info-badge",   # 스마트에디터 협찬 배지
+                            "sponsor_badge",           # 구형 협찬 배지
+                            "ffd_badge",               # 유료광고 배지
+                            "#협찬",                   # 해시태그 텍스트 포함
+                            "협찬배지",
+                            "badge_type_sponsor",
+                            "badge_sponsor",
+                            "postListData.*sponsor",
+                            "data-sponsor",
+                            "disclosure-badge",
+                            "공정위",                  # 공정위 문구
+                        ]
+                        for pat in sponsored_patterns:
+                            if pat in html_source:
+                                is_sponsored_badge = True
+                                print(f"[블로그 원문] 협찬 배지 감지: '{pat}'")
+                                break
+
+                        # iframe 내부도 확인
+                        if not is_sponsored_badge:
+                            try:
+                                frame = page.frame(name="mainFrame")
+                                if frame:
+                                    frame_html = frame.content()
+                                    for pat in sponsored_patterns:
+                                        if pat in frame_html:
+                                            is_sponsored_badge = True
+                                            print(f"[블로그 원문] iframe 협찬 배지 감지: '{pat}'")
+                                            break
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        print(f"[블로그 원문] 배지 감지 오류: {e}")
+
                     full_text = ""
                     try:
                         frame = page.frame(name="mainFrame")
@@ -509,6 +550,10 @@ def classify_blog_originals(blog_links):
                         try: full_text = page.inner_text("body")
                         except Exception: full_text = ""
 
+                    # 협찬 배지가 감지된 경우 텍스트에 협찬 키워드 주입
+                    if is_sponsored_badge:
+                        full_text = "협찬 " + full_text
+
                     ad_type = classify_ad(full_text)
                     title = item.get("title","")
                     if not title:
@@ -519,7 +564,7 @@ def classify_blog_originals(blog_links):
                         "title": title or "제목 없음",
                         "text": full_text[:500],
                         "ad_type": ad_type,
-                        "ad_basis": get_basis(full_text, ad_type),
+                        "ad_basis": "협찬 배지 감지 (이미지형 UI)" if is_sponsored_badge else get_basis(full_text, ad_type),
                         "source": "naver_blog",
                         "url": item["url"],
                     })
