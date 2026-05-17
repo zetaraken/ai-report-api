@@ -624,20 +624,70 @@ def classify_blog_originals(blog_links):
 # STEP 4: 네이버 검색 수
 # ════════════════════════════════════════════════════════════
 def crawl_naver_search_count(merchant_name, region):
+    """
+    네이버 블로그 검색 총 건수 수집.
+    - 1차: 블로그 탭 상단 '약 N,000개' 텍스트 파싱
+    - 2차: 통합검색 블로그 섹션 '더보기' 옆 숫자 파싱
+    - 3차: 노출된 li.bx 개수 (폴백, 정확도 낮음)
+    """
     query = f"{region} {merchant_name}".strip()
     count = 0
     try:
         with sync_playwright() as p:
             browser, ctx = make_pc_browser(p)
             page = ctx.new_page()
-            page.goto(f"https://search.naver.com/search.naver?query={quote(query)}&where=blog",
-                      wait_until="domcontentloaded", timeout=20000)
-            time.sleep(1.5)
+
+            # 1차: 블로그 탭 전체 건수 ('약 N,000개' 형식)
+            page.goto(
+                f"https://search.naver.com/search.naver?query={quote(query)}&where=blog",
+                wait_until="domcontentloaded", timeout=20000
+            )
+            time.sleep(2.0)
             text = page.inner_text("body")
-            m = re.search(r'약\s*([\d,]+)\s*개', text)
-            if m: count = int(m.group(1).replace(",",""))
+
+            # '약 1,234개' 또는 '1,234개의 검색결과' 패턴
+            for pattern in [
+                r'약\s*([\d,]+)\s*개',
+                r'([\d,]+)\s*개의\s*검색결과',
+                r'검색결과\s*([\d,]+)\s*개',
+                r'총\s*([\d,]+)\s*개',
+            ]:
+                m = re.search(pattern, text)
+                if m:
+                    count = int(m.group(1).replace(",", ""))
+                    print(f"[네이버 검색] 패턴 '{pattern}' 매칭: {count}건")
+                    break
+
+            # 2차: HTML에서 직접 건수 요소 파싱
             if count == 0:
-                count = len(page.locator("li.bx").all())
+                try:
+                    # 네이버 블로그 탭 총 건수 셀렉터
+                    for sel in [
+                        ".blog_count",
+                        ".total_count",
+                        ".result_num",
+                        "span.num",
+                        ".count strong",
+                    ]:
+                        els = page.locator(sel).all()
+                        for el in els:
+                            t = el.inner_text().strip().replace(",", "")
+                            if t.isdigit() and int(t) > 10:
+                                count = int(t)
+                                print(f"[네이버 검색] 셀렉터 '{sel}' 매칭: {count}건")
+                                break
+                        if count > 0:
+                            break
+                except Exception:
+                    pass
+
+            # 3차: 노출된 결과 개수 (폴백)
+            if count == 0:
+                items = page.locator("li.bx").all()
+                count = len(items)
+                print(f"[네이버 검색] 폴백(li.bx): {count}건")
+
+            print(f"[네이버 검색] 최종: {count}건 (쿼리: '{query}')")
             browser.close()
     except Exception as e:
         print(f"[네이버 검색 오류] {e}")
