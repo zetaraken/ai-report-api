@@ -626,9 +626,9 @@ def classify_blog_originals(blog_links):
 def crawl_naver_search_count(merchant_name, region):
     """
     네이버 블로그 검색 총 건수 수집.
-    - 1차: 블로그 탭 상단 '약 N,000개' 텍스트 파싱
-    - 2차: 통합검색 블로그 섹션 '더보기' 옆 숫자 파싱
-    - 3차: 노출된 li.bx 개수 (폴백, 정확도 낮음)
+    - 1차: 블로그 탭 HTML 원본에서 숫자 직접 추출
+    - 2차: 통합검색 페이지 블로그 섹션 카운트
+    - 3차: requests 직접 호출 (JS 불필요한 초기 HTML)
     """
     query = f"{region} {merchant_name}".strip()
     count = 0
@@ -637,55 +637,95 @@ def crawl_naver_search_count(merchant_name, region):
             browser, ctx = make_pc_browser(p)
             page = ctx.new_page()
 
-            # 1차: 블로그 탭 전체 건수 ('약 N,000개' 형식)
+            # 1차: 블로그 탭 — networkidle까지 대기 후 HTML 파싱
             page.goto(
                 f"https://search.naver.com/search.naver?query={quote(query)}&where=blog",
-                wait_until="domcontentloaded", timeout=20000
+                wait_until="networkidle", timeout=25000
             )
-            time.sleep(2.0)
+            time.sleep(2.5)
+
+            # HTML 원본에서 숫자 패턴 탐색 (innerText보다 정확)
+            html = page.content()
             text = page.inner_text("body")
 
-            # '약 1,234개' 또는 '1,234개의 검색결과' 패턴
+            # 네이버 블로그 탭 총 건수 패턴들
             for pattern in [
                 r'약\s*([\d,]+)\s*개',
-                r'([\d,]+)\s*개의\s*검색결과',
-                r'검색결과\s*([\d,]+)\s*개',
-                r'총\s*([\d,]+)\s*개',
+                r'"totalCount"\s*:\s*(\d+)',       # JSON 데이터
+                r'total_count["\s:]+(\d+)',         # JS 변수
+                r'totalCount["\s:]+(\d+)',
+                r'<strong[^>]*>\s*([\d,]+)\s*</strong>\s*개',
+                r'([\d,]+)\s*개의?\s*검색결과',
+                r'검색결과\s*([\d,]+)',
+                r'결과\s*([\d,]+)\s*개',
             ]:
-                m = re.search(pattern, text)
+                # HTML에서 먼저 탐색
+                m = re.search(pattern, html)
+                if not m:
+                    m = re.search(pattern, text)
                 if m:
-                    count = int(m.group(1).replace(",", ""))
-                    print(f"[네이버 검색] 패턴 '{pattern}' 매칭: {count}건")
-                    break
+                    val = int(m.group(1).replace(",", ""))
+                    if val > 5:  # 의미있는 숫자만
+                        count = val
+                        print(f"[네이버 검색] 패턴 '{pattern}' 매칭: {count}건")
+                        break
 
-            # 2차: HTML에서 직접 건수 요소 파싱
+            # 2차: CSS 셀렉터로 총 건수 요소 탐색
             if count == 0:
-                try:
-                    # 네이버 블로그 탭 총 건수 셀렉터
-                    for sel in [
-                        ".blog_count",
-                        ".total_count",
-                        ".result_num",
-                        "span.num",
-                        ".count strong",
-                    ]:
+                for sel in [
+                    ".title_num",          # 네이버 블로그탭 카운트
+                    ".blog_count strong",
+                    ".total_count",
+                    "span.num_total",
+                    ".result_num strong",
+                    "em.num",
+                ]:
+                    try:
                         els = page.locator(sel).all()
                         for el in els:
-                            t = el.inner_text().strip().replace(",", "")
-                            if t.isdigit() and int(t) > 10:
+                            t = el.inner_text().strip().replace(",", "").replace("약", "").strip()
+                            if t.isdigit() and int(t) > 5:
                                 count = int(t)
-                                print(f"[네이버 검색] 셀렉터 '{sel}' 매칭: {count}건")
+                                print(f"[네이버 검색] 셀렉터 '{sel}': {count}건")
                                 break
                         if count > 0:
                             break
+                    except Exception:
+                        continue
+
+            # 3차: 통합검색 페이지에서 블로그 섹션 건수 파싱
+            if count == 0:
+                try:
+                    page.goto(
+                        f"https://search.naver.com/search.naver?query={quote(query)}",
+                        wait_until="networkidle", timeout=25000
+                    )
+                    time.sleep(2.0)
+                    html2 = page.content()
+                    # 블로그 섹션 총 건수
+                    for pattern in [
+                        r'"blog"[^}]*"totalCount"\s*:\s*(\d+)',
+                        r'blog.*?총\s*([\d,]+)\s*건',
+                        r'블로그.*?([\d,]+)\s*건',
+                    ]:
+                        m = re.search(pattern, html2, re.DOTALL)
+                        if m:
+                            val = int(m.group(1).replace(",", ""))
+                            if val > 5:
+                                count = val
+                                print(f"[네이버 검색] 통합검색 패턴: {count}건")
+                                break
+                except Exception as e2:
+                    print(f"[네이버 검색] 통합검색 오류: {e2}")
+
+            # 4차: li.bx 노출 건수 (폴백)
+            if count == 0:
+                try:
+                    items = page.locator("li.bx").all()
+                    count = len(items)
+                    print(f"[네이버 검색] 폴백(li.bx): {count}건")
                 except Exception:
                     pass
-
-            # 3차: 노출된 결과 개수 (폴백)
-            if count == 0:
-                items = page.locator("li.bx").all()
-                count = len(items)
-                print(f"[네이버 검색] 폴백(li.bx): {count}건")
 
             print(f"[네이버 검색] 최종: {count}건 (쿼리: '{query}')")
             browser.close()
