@@ -104,18 +104,31 @@ def inject_cookies(ctx):
 
 # ── 광고 판별 ─────────────────────────────────────────────────────
 AD_KW = [
+    # 직접 협찬/광고 표시
     "협찬","제공받","유료광고","스폰서","서포터즈","체험단",
     "무상제공","소정의 원고료","원고료를 받고","업체로부터",
     "브랜드로부터","광고임을","PPL","paid partnership",
     "sponsored","#광고","#협찬","#체험단","#서포터즈",
     "#소정의원고료","원고료","제품을 제공","무료로 받",
     "무료체험","지원받","지원을 받","제공해주","광고비",
+    # 협찬 암시 표현 (체험단/협찬 글에서 자주 사용)
+    "방문해보았습니다","방문했습니다","다녀왔습니다","소개해드리겠습니다",
+    "소개해드릴게요","소개해드리려고","알려드릴게요","알려드리겠습니다",
+    "정보 제공","정보를 제공","서비스 제공","무료로 제공",
+    "할인 코드","할인코드","쿠폰 코드","쿠폰코드",
+    "공식 블로그","공식블로그","브랜드 체험","브랜드체험",
+    "체험 후기","체험후기","무료 체험","무료체험",
+    "제품 제공","제품제공","식사 제공","식사제공",
+    "초대받아","초대를 받","招待","invite",
+    "본 포스팅은","이 포스팅은","해당 포스팅은",
+    "내돈내산아님","#내돈내산아님",
 ]
 AD_KW_WORD = ["광고"]
 ORG_KW = [
     "내돈내산","내돈내먹","솔직후기","솔직리뷰","개인적인 의견",
     "자비로","직접 구매","내 돈 주고","내돈주고","순수 후기",
     "광고아님","비광고","광고 아님","돈 받지 않",
+    "개인 방문","개인방문","자발적","자비",
 ]
 
 def classify_ad(text):
@@ -492,29 +505,45 @@ def classify_blog_originals(blog_links):
                     page.goto(url, wait_until="domcontentloaded", timeout=8000)
                     time.sleep(0.8)
 
-                    # ── 협찬 배지 HTML 감지 (텍스트로 안 잡히는 이미지형 배지) ──
-                    # 네이버 블로그 #협찬 배지: 특정 클래스/속성으로 렌더링됨
+                    # ── 협찬 배지 감지 ──────────────────────────────
+                    # 네이버 #협찬 배지는 이미지로 렌더링되어 innerText로 추출 불가
+                    # HTML 소스 및 JS 변수에서 협찬 정보 탐지
                     is_sponsored_badge = False
                     try:
                         html_source = page.content()
-                        # 협찬 배지 관련 HTML 패턴들
+                        # 네이버 블로그 협찬 정보 패턴
                         sponsored_patterns = [
-                            "se-oglink-info-badge",   # 스마트에디터 협찬 배지
-                            "sponsor_badge",           # 구형 협찬 배지
-                            "ffd_badge",               # 유료광고 배지
-                            "#협찬",                   # 해시태그 텍스트 포함
-                            "협찬배지",
-                            "badge_type_sponsor",
-                            "badge_sponsor",
-                            "postListData.*sponsor",
-                            "data-sponsor",
-                            "disclosure-badge",
-                            "공정위",                  # 공정위 문구
+                            # ① 공정위 협찬 배지 이미지 서버 (확인된 도메인)
+                            "reviewnote.cloud",    # 리뷰노트 협찬 배지 (실제 확인)
+                            "gongjeong/v1/image",  # 공정위 배지 이미지 경로 공통
+                            # ② 주요 체험단 플랫폼 도메인 (협찬 배지 이미지 삽입)
+                            "revu.net",            # 레뷰
+                            "revulink.net",        # 레뷰 링크
+                            "tagby.io",            # 태그바이
+                            "cloudreview",         # 클라우드리뷰
+                            "chehumdan.com",       # 체험단닷컴
+                            "naver.me/campaign",   # 네이버 캠페인
+                            "insflu.com",          # 인스플루
+                            "reviewplace",         # 리뷰플레이스
+                            "naverblog.badge",     # 네이버 블로그 배지
+                            "posting.monster",     # 포스팅몬스터
+                            "linkprice.com",       # 링크프라이스
+                            "tenping.kr",          # 텐핑
+                            "buzzstore.co.kr",     # 버즈스토어
+                            "ohouse.co.kr/campaign",  # 오늘의집 캠페인
+                            # ③ 공정위 관련 JS/HTML 변수
+                            "ffdInfo",             # 협찬 정보 JS 변수
+                            "ffd_badge",           # 협찬 배지 클래스
+                            "ffdYn",               # 협찬 여부 플래그
+                            "isFFD",               # 협찬 여부 플래그2
+                            "sponsorInfo",         # 스폰서 정보
+                            '"ffd":true',          # JSON 협찬 플래그
+                            "isSponsor",           # 스폰서 여부
                         ]
                         for pat in sponsored_patterns:
                             if pat in html_source:
                                 is_sponsored_badge = True
-                                print(f"[블로그 원문] 협찬 배지 감지: '{pat}'")
+                                print(f"[블로그 원문] 협찬 감지(HTML): '{pat}'")
                                 break
 
                         # iframe 내부도 확인
@@ -526,10 +555,11 @@ def classify_blog_originals(blog_links):
                                     for pat in sponsored_patterns:
                                         if pat in frame_html:
                                             is_sponsored_badge = True
-                                            print(f"[블로그 원문] iframe 협찬 배지 감지: '{pat}'")
+                                            print(f"[블로그 원문] 협찬 감지(iframe): '{pat}'")
                                             break
                             except Exception:
                                 pass
+
                     except Exception as e:
                         print(f"[블로그 원문] 배지 감지 오류: {e}")
 
