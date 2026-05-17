@@ -681,6 +681,7 @@ def crawl_naver_search_count(merchant_name, region, addr_keyword=""):
     try:
         with sync_playwright() as p:
             browser, ctx = make_pc_browser(p)
+            inject_cookies(ctx)  # 네이버 쿠키 주입
             page = ctx.new_page()
 
             # 1차: 블로그 탭 — domcontentloaded 후 JS 렌더링 대기
