@@ -104,24 +104,15 @@ def inject_cookies(ctx):
 
 # ── 광고 판별 ─────────────────────────────────────────────────────
 AD_KW = [
-    # 직접 협찬/광고 표시
+    # 직접 협찬/광고 표시 텍스트
     "협찬","제공받","유료광고","스폰서","서포터즈","체험단",
     "무상제공","소정의 원고료","원고료를 받고","업체로부터",
     "브랜드로부터","광고임을","PPL","paid partnership",
     "sponsored","#광고","#협찬","#체험단","#서포터즈",
     "#소정의원고료","원고료","제품을 제공","무료로 받",
     "무료체험","지원받","지원을 받","제공해주","광고비",
-    # 협찬 암시 표현 (체험단/협찬 글에서 자주 사용)
-    "방문해보았습니다","방문했습니다","다녀왔습니다","소개해드리겠습니다",
-    "소개해드릴게요","소개해드리려고","알려드릴게요","알려드리겠습니다",
-    "정보 제공","정보를 제공","서비스 제공","무료로 제공",
-    "할인 코드","할인코드","쿠폰 코드","쿠폰코드",
-    "공식 블로그","공식블로그","브랜드 체험","브랜드체험",
-    "체험 후기","체험후기","무료 체험","무료체험",
-    "제품 제공","제품제공","식사 제공","식사제공",
-    "초대받아","초대를 받","招待","invite",
-    "본 포스팅은","이 포스팅은","해당 포스팅은",
-    "내돈내산아님","#내돈내산아님",
+    # 명확한 협찬 표시
+    "무료로 제공받아","초대받아 방문",
 ]
 AD_KW_WORD = ["광고"]
 ORG_KW = [
@@ -138,8 +129,8 @@ def classify_ad(text):
               if re.search(r'(?<![가-힣a-z])' + re.escape(kw) + r'(?![가-힣a-z])', t))
     org = sum(1 for kw in ORG_KW if kw.lower() in t)
     if ad > 0 and ad >= org: return "광고"
-    elif org > 0: return "내돈내산"
-    return "판별불가"
+    if org > 0: return "내돈내산"
+    return "내돈내산"  # 협찬 배지 없고 광고 키워드도 없으면 내돈내산
 
 def get_basis(text, ad_type):
     if ad_type == "광고":
@@ -338,10 +329,9 @@ def crawl_receipt_reviews(place_id, target=500):
                 t = t.strip()
                 if len(t) >= 10 and t not in seen_texts:
                     seen_texts.add(t)
-                    ad_type = classify_ad(t)
                     reviews.append({
-                        "text": t[:500], "ad_type": ad_type,
-                        "ad_basis": get_basis(t, ad_type), "source": "naver_receipt",
+                        "text": t[:500],
+                        "source": "naver_receipt",
                     })
                     new_count += 1
                 elif len(t) >= 10:
@@ -513,30 +503,23 @@ def classify_blog_originals(blog_links):
                         html_source = page.content()
                         # 네이버 블로그 협찬 정보 패턴
                         sponsored_patterns = [
-                            # ① 공정위 협찬 배지 이미지 서버 (확인된 도메인)
-                            "reviewnote.cloud",    # 리뷰노트 협찬 배지 (실제 확인)
+                            # ① 공정위 협찬 배지 이미지 서버 (실제 확인된 도메인)
+                            "reviewnote.cloud",    # 리뷰노트 배지 서버1 (확인)
+                            "reviewnote.co.kr",    # 리뷰노트 배지 서버2 (확인)
+                            "reviewnote.webp",     # 리뷰노트 배지 이미지 파일명 (확인)
+                            "imagepool.io",        # 협찬 배지 CDN 서버 (확인)
                             "gongjeong/v1/image",  # 공정위 배지 이미지 경로 공통
-                            # ② 주요 체험단 플랫폼 도메인 (협찬 배지 이미지 삽입)
+                            # ② 주요 체험단 플랫폼 도메인
                             "revu.net",            # 레뷰
-                            "revulink.net",        # 레뷰 링크
                             "tagby.io",            # 태그바이
                             "cloudreview",         # 클라우드리뷰
                             "chehumdan.com",       # 체험단닷컴
-                            "naver.me/campaign",   # 네이버 캠페인
-                            "insflu.com",          # 인스플루
-                            "reviewplace",         # 리뷰플레이스
-                            "naverblog.badge",     # 네이버 블로그 배지
-                            "posting.monster",     # 포스팅몬스터
-                            "linkprice.com",       # 링크프라이스
                             "tenping.kr",          # 텐핑
-                            "buzzstore.co.kr",     # 버즈스토어
-                            "ohouse.co.kr/campaign",  # 오늘의집 캠페인
+                            "linkprice.com",       # 링크프라이스
+                            "posting.monster",     # 포스팅몬스터
                             # ③ 공정위 관련 JS/HTML 변수
                             "ffdInfo",             # 협찬 정보 JS 변수
-                            "ffd_badge",           # 협찬 배지 클래스
                             "ffdYn",               # 협찬 여부 플래그
-                            "isFFD",               # 협찬 여부 플래그2
-                            "sponsorInfo",         # 스폰서 정보
                             '"ffd":true',          # JSON 협찬 플래그
                             "isSponsor",           # 스폰서 여부
                         ]
@@ -768,12 +751,9 @@ if __name__ == "__main__":
             "total_blog_reviews":     len(blog_list),
             "naver_search_count":     naver_cnt,
             "instagram_count":        ig_cnt,
-            "blog_ad_count":      sum(1 for r in blog_list if r["ad_type"]=="광고"),
-            "blog_organic_count": sum(1 for r in blog_list if r["ad_type"]=="내돈내산"),
-            "blog_unknown_count": sum(1 for r in blog_list if r["ad_type"]=="판별불가"),
-            "receipt_ad_count":      sum(1 for r in receipt_list if r["ad_type"]=="광고"),
-            "receipt_organic_count": sum(1 for r in receipt_list if r["ad_type"]=="내돈내산"),
-            "receipt_unknown_count": sum(1 for r in receipt_list if r["ad_type"]=="판별불가"),
+            "blog_ad_count":      sum(1 for r in blog_list if r.get("ad_type")=="광고"),
+            "blog_organic_count": sum(1 for r in blog_list if r.get("ad_type")=="내돈내산"),
+            "blog_unknown_count": sum(1 for r in blog_list if r.get("ad_type")=="판별불가"),
         }
     }
 
