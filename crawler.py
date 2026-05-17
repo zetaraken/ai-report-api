@@ -24,20 +24,35 @@ from playwright.sync_api import sync_playwright
 
 
 # ── 네이버 쿠키 로드 ──────────────────────────────────────────────
-# Railway 환경변수 NAVER_COOKIES에 JSON 배열로 저장
-# 예: [{"name":"NID_AUT","value":"xxx","domain":".naver.com"},...]
+# Railway 환경변수에 개별 등록된 쿠키들을 읽어서 Playwright용 배열로 변환
+# 등록된 변수: ASID, BUC, NAC, nid_inf, NID_JST 등
 def load_naver_cookies():
-    raw = os.environ.get("NAVER_COOKIES", "")
-    if not raw:
-        print("[쿠키] NAVER_COOKIES 환경변수 없음 → 비로그인 모드")
-        return []
-    try:
-        cookies = json.loads(raw)
-        print(f"[쿠키] 네이버 쿠키 {len(cookies)}개 로드 성공")
-        return cookies
-    except Exception as e:
-        print(f"[쿠키] 파싱 오류: {e}")
-        return []
+    cookie_defs = [
+        ("NID_AUT",   ".naver.com"),
+        ("NID_SES",   ".naver.com"),
+        ("NID_JST",   ".nid.naver.com"),
+        ("BUC",       ".naver.com"),
+        ("ASID",      ".naver.com"),
+        ("NAC",       ".naver.com"),
+        ("nid_inf",   ".naver.com"),
+        ("nid_buk",   ".nid.naver.com"),
+        ("NNB",       ".naver.com"),
+    ]
+    cookies = []
+    for name, domain in cookie_defs:
+        value = os.environ.get(name, "")
+        if value:
+            cookies.append({
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": "/",
+            })
+    if cookies:
+        print(f"[쿠키] {len(cookies)}개 로드: {[c['name'] for c in cookies]}")
+    else:
+        print("[쿠키] 환경변수 없음 → 비로그인 모드")
+    return cookies
 
 NAVER_COOKIES = load_naver_cookies()
 
