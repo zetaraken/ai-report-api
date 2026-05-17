@@ -204,27 +204,35 @@ def get_official_counts(place_id):
             addr_kw = ""
             html_home = page.content()
 
-            # 네이버 플레이스 HTML 실제 구조:
-            # <span class="TjXg1">지번</span>"경기 화성시 동탄구 방교동 771-4"
+            # 1순위: HTML에서 지번주소 파싱
             dong_patterns = [
-                # 실제 확인된 패턴: TjXg1 클래스 span 다음 지번주소 텍스트
-                r'TjXg1[^>]*>지번</span>\s*"?경기[^"]*?([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
-                r'TjXg1[^>]*>지번</span>[^가-힣]{0,30}([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
-                # JSON 형태
+                r'TjXg1[^>]*>지번</span>[^가-힣]*([가-힣]{2,5}(?:동|읍|면|리))\s*\d',
                 r'"jibunAddress"\s*:\s*"[^"]*?([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
-                # 지번 텍스트 기반
-                r'지번[^가-힣]{0,20}([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
-                # 지번 형식 (동명 + 번지)
+                r'지번[^가-힣]{0,30}([가-힣]{2,5}(?:동|읍|면|리))\s+\d',
                 r'([가-힣]{2,5}(?:동|읍|면|리))\s+\d{2,4}-\d{1,4}',
             ]
             for pat in dong_patterns:
                 m = re.search(pat, html_home)
                 if m:
                     addr_kw = m.group(1)
-                    print(f"[주소 키워드] '{addr_kw}' 추출 (HTML 지번)")
+                    print(f"[주소 키워드] '{addr_kw}' 추출 (HTML)")
                     break
 
-            # 폴백: innerText에서 읍면동 추출
+            # 2순위: 꺽쇠 버튼 클릭 후 지번주소 읽기
+            if not addr_kw:
+                try:
+                    btn = page.locator('a[aria-haspopup="true"], button[aria-expanded]').first
+                    btn.click(timeout=3000)
+                    time.sleep(0.8)
+                    expanded_text = page.inner_text("body")
+                    m2 = re.search(r'지번[^가-힣]{0,30}([가-힣]{2,5}(?:동|읍|면|리))\s+\d', expanded_text)
+                    if m2:
+                        addr_kw = m2.group(1)
+                        print(f"[주소 키워드] '{addr_kw}' 추출 (클릭 후)")
+                except Exception as e:
+                    print(f"[주소 키워드] 클릭 시도 실패: {e}")
+
+            # 3순위: innerText에서 읍면동 추출
             if not addr_kw:
                 dong_in_text = re.search(
                     r'(?:[가-힣]+시|[가-힣]+군)\s+'
@@ -236,9 +244,6 @@ def get_official_counts(place_id):
                 if dong_in_text:
                     addr_kw = dong_in_text.group(1)
                     print(f"[주소 키워드] '{addr_kw}' 추출 (텍스트)")
-
-            if not addr_kw:
-                print(f"[주소 키워드] 추출 실패 — region 폴백 사용")
 
             if not addr_kw:
                 print(f"[주소 키워드] 추출 실패 — region 폴백 사용")
