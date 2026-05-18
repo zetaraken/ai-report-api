@@ -462,7 +462,14 @@ def crawl_blog_links(place_id, merchant_name="", target=100):
                     title = a.get_text(strip=True)[:120]
                     parent = a.find_parent("li") or a.find_parent("div")
                     excerpt = parent.get_text(strip=True)[:300] if parent else ""
-                    links.append({"url": href, "title": title, "excerpt": excerpt})
+                    # 날짜 파싱: "2026. 1. 3." 또는 "2026.01.03" 형태
+                    date_str = ""
+                    if parent:
+                        date_m = re.search(r'(\d{4})[.\-]\s*(\d{1,2})[.\-]\s*(\d{1,2})', parent.get_text())
+                        if date_m:
+                            y, m, d = date_m.group(1), date_m.group(2).zfill(2), date_m.group(3).zfill(2)
+                            date_str = f"{y}-{m}-{d}"
+                    links.append({"url": href, "title": title, "excerpt": excerpt, "date": date_str})
 
                 current = len(links)
                 print(f"[블로그] 라운드 {round_num}: {current}건")
@@ -617,6 +624,7 @@ def classify_blog_originals(blog_links):
                         "ad_basis": "협찬 배지 감지 (이미지형 UI)" if is_sponsored_badge else get_basis(full_text, ad_type),
                         "source": "naver_blog",
                         "url": item["url"],
+                        "date": item.get("date", ""),
                     })
                     print(f"[블로그 원문] {idx+1}/{total} {ad_type} - {(title or '')[:30]}")
 
@@ -889,6 +897,42 @@ if __name__ == "__main__":
     receipt_list = receipt
     blog_list    = blog_reviews
 
+    # ── 키워드 Top 10 추출 ──────────────────────────────────────
+    def extract_keywords(reviews, top_n=10):
+        stopwords = {
+            "이","가","을","를","은","는","의","에","에서","와","과","도","만","로","으로",
+            "이다","있다","없다","하다","되다","그","수","것","때","곳","좀","더","정말",
+            "너무","매우","아주","진짜","완전","거의","다시","또","항상","제목","없음",
+            "블로그","리뷰","방문","가게","식당","맛집","네이버","플레이스",
+            "이전","다음","펼쳐서","더보기","닫기","감자탕","감자","순자매",
+        }
+        from collections import Counter
+        word_counts = Counter()
+        for r in reviews:
+            text = r.get("text","") + " " + r.get("title","")
+            words = re.findall(r'[가-힣]{2,8}', text)
+            for w in words:
+                if w not in stopwords:
+                    word_counts[w] += 1
+        return [{"word": w, "count": c} for w, c in word_counts.most_common(top_n)]
+
+    # ── 월별 블로그 집계 ────────────────────────────────────────
+    def monthly_blog_stats(blog_reviews):
+        from collections import defaultdict
+        monthly = defaultdict(lambda: {"total":0,"ad":0,"organic":0})
+        for r in blog_reviews:
+            date = r.get("date","")
+            if date and len(date) >= 7:
+                ym = date[:7]
+                monthly[ym]["total"] += 1
+                if r.get("ad_type") == "광고":     monthly[ym]["ad"] += 1
+                elif r.get("ad_type") == "내돈내산": monthly[ym]["organic"] += 1
+        return [{"month": k, **v} for k, v in sorted(monthly.items())]
+
+    top_keywords_blog    = extract_keywords(blog_list, top_n=10)
+    top_keywords_receipt = extract_keywords(receipt_list, top_n=10)
+    monthly_stats        = monthly_blog_stats(blog_list)
+
     result = {
         "place_counts": counts,
         "naver_receipt_reviews": receipt_list,
@@ -907,6 +951,9 @@ if __name__ == "__main__":
             "blog_ad_count":      sum(1 for r in blog_list if r.get("ad_type")=="광고"),
             "blog_organic_count": sum(1 for r in blog_list if r.get("ad_type")=="내돈내산"),
             "blog_unknown_count": sum(1 for r in blog_list if r.get("ad_type")=="판별불가"),
+            "top_keywords_blog":    top_keywords_blog,
+            "top_keywords_receipt": top_keywords_receipt,
+            "monthly_blog_stats":   monthly_stats,
         }
     }
 
