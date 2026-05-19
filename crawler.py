@@ -1,7 +1,18 @@
 """
-crawler.py - SNS 분석 독립 크롤러 v47
+crawler.py - SNS 분석 독립 크롤러 v49
 subprocess로 실행되어 greenlet 충돌을 원천 차단.
 결과는 JSON 파일로 저장.
+
+v49 변경사항:
+  1. 영수증 리뷰 날짜 수집 추가 (pui__blind 등 선택자 기반)
+  2. 영수증 월별 집계(monthly_receipt_stats) summary에 추가
+  3. Top5 키워드 카테고리 균형 선정 (메뉴/위치/경험 대표 키워드)
+  4. Top5에 카테고리 라벨 부여
+
+v48 변경사항:
+  1. 감성 정성 해석 구체화: 실제 리뷰 수치+상위 키워드 포함
+  2. Pros/Cons 포인트 실제 건수 기반 자동 생성
+  3. Cons 비어있을 때 '지속적 관리' 포인트 자동 추가
 
 v47 변경사항:
   1. 감성분석 정성 해석 텍스트 자동 생성 (긍정/중립/주의/Pros/Cons)
@@ -341,22 +352,50 @@ def crawl_receipt_reviews(place_id, target=500):
             print(f"[영수증] Selenium 쿠키 {len(NAVER_COOKIES)}개 주입")
         return driver
 
+    def _parse_receipt_date(html):
+        """영수증 리뷰 HTML에서 날짜 추출 → YYYY-MM"""
+        for pat in [
+            r'"visitDate"\s*:\s*"?(\d{8})"?',
+            r'"visitDate"\s*:\s*"(20\d{2})-(\d{2})',
+            r'pui__blind[^>]*>(20\d{2})[.](\d{2})',
+            r'pui__gfuUIT[^>]*>(\d{2})[.](\d{2})',
+            r'(20\d{2})[.](\d{2})[.]\d{2}',
+        ]:
+            mt = re.search(pat, html)
+            if mt:
+                if len(mt.groups()) == 1:
+                    raw = mt.group(1)
+                    if len(raw) == 8 and 2020 <= int(raw[:4]) <= 2030:
+                        return f"{raw[:4]}-{raw[4:6]}"
+                elif len(mt.groups()) == 2:
+                    y, mo = mt.group(1), mt.group(2)
+                    if len(y) == 2: y = "20" + y
+                    if 2020 <= int(y) <= 2030 and 1 <= int(mo) <= 12:
+                        return f"{y}-{mo.zfill(2)}"
+        return ""
+
     def collect_from_html(html):
         soup = BeautifulSoup(html, "html.parser")
-        texts = []
+        items = []  # (text, date) 튜플
         SKIP = {"펼쳐서 더보기","더보기","반응 남기기","좋아요","신고","접기"}
-        for el in soup.select("div.pui__vn15t2"):
-            t = el.get_text(strip=True)
-            for s in SKIP: t = t.replace(s, "").strip()
-            if len(t) >= 10:
-                texts.append(t)
-        if not texts:
-            for li in soup.select("li.pui__X35jYm"):
-                t = li.get_text(strip=True)
+
+        # 리뷰 아이템별로 텍스트+날짜 함께 추출
+        review_els = soup.select("li.pui__X35jYm") or soup.select("div.pui__vn15t2")
+        if review_els:
+            for li in review_els:
+                t = li.get_text(separator=" ", strip=True)
                 for s in SKIP: t = t.replace(s, "").strip()
                 if len(t) >= 10:
-                    texts.append(t)
-        return texts
+                    date = _parse_receipt_date(str(li))
+                    items.append((t, date))
+        else:
+            # 폴백: 전체 HTML에서 텍스트만
+            for el in soup.select("div.pui__vn15t2"):
+                t = el.get_text(strip=True)
+                for s in SKIP: t = t.replace(s, "").strip()
+                if len(t) >= 10:
+                    items.append((t, ""))
+        return items
 
     def sel_scroll(driver, steps=5):
         try:
@@ -394,13 +433,15 @@ def crawl_receipt_reviews(place_id, target=500):
 
             raw = collect_from_html(driver.page_source)
             new_count = 0
-            for t in raw:
+            for item in raw:
+                t, d = (item if isinstance(item, tuple) else (item, ""))
                 t = t.strip()
                 if len(t) >= 10 and t not in seen_texts:
                     seen_texts.add(t)
                     reviews.append({
                         "text": t[:500],
                         "source": "naver_receipt",
+                        "date": d,
                     })
                     new_count += 1
                 elif len(t) >= 10:
@@ -1092,50 +1133,85 @@ if __name__ == "__main__":
         neu_pct = round(neu_count / total_s * 100)
 
         # ── 감성 정성 해석 자동 생성 ─────────────────────────
-        # 광고/내돈내산 카운트 (정성 해석용)
+        # 광고/내돈내산 카운트
         _ad_cnt  = sum(1 for r in blog_reviews if r.get("ad_type") == "광고")
         _org_cnt = sum(1 for r in blog_reviews if r.get("ad_type") == "내돈내산")
         _total_b = max(len(blog_reviews), 1)
         _ad_pct  = round(_ad_cnt  / _total_b * 100)
         _org_pct = round(_org_cnt / _total_b * 100)
-        # 긍정 반응 해석
-        pos_kw_top = []
+
+        # 긍정 키워드 상위 3개 추출 (불용어 제외 후 pos_words 기준)
+        _pos_top = [w for w, _ in pos_words.most_common(5)][:3]
+        _neg_top = [w for w, _ in neg_words.most_common(5)][:3]
+        _pos_top_str = "·".join(_pos_top) if _pos_top else "만족"
+        _neg_top_str = "·".join(_neg_top) if _neg_top else "불만"
+
+        # 긍정 반응 해석 — 수치+키워드 포함
         if pos_pct >= 80:
-            pos_interp = f"수집된 전체 리뷰의 {pos_pct}%가 긍정 반응으로, 방문 고객의 전반적인 만족도가 높은 상태입니다."
+            pos_interp = (f"수집된 전체 리뷰 {pos_count+neg_count+neu_count}건의 {pos_pct}%가 긍정 반응으로, "
+                         f"방문 고객의 전반적인 만족도가 높은 상태입니다. "
+                         f"'{_pos_top_str}' 등의 표현이 반복적으로 확인됩니다.")
         elif pos_pct >= 60:
-            pos_interp = f"리뷰의 {pos_pct}%가 긍정 반응으로, 전반적으로 양호한 평가를 받고 있습니다."
+            pos_interp = (f"리뷰 {pos_count+neg_count+neu_count}건 중 {pos_pct}%인 {pos_count}건이 긍정 반응으로, "
+                         f"전반적으로 양호한 평가를 받고 있습니다.")
         else:
-            pos_interp = f"긍정 반응이 {pos_pct}%로, 고객 만족도 개선이 필요한 상황입니다."
+            pos_interp = (f"긍정 반응이 {pos_pct}%({pos_count}건)로, "
+                         f"고객 만족도 개선을 위한 운영 전략 점검이 필요합니다.")
 
         # 중립 반응 해석
         if neu_pct >= 20:
-            neu_interp = f"중립 반응이 {neu_pct}%로, 위치·영업시간·메뉴 정보 등 단순 정보 전달형 언급이 일정 비중을 차지합니다."
+            neu_interp = (f"중립 반응이 {neu_pct}%({neu_count}건)로, "
+                         f"위치·영업시간·예약 링크·계정 태그 공유 등 정보 전달형 언급이 일정 비중을 차지합니다.")
         else:
-            neu_interp = f"중립 반응은 {neu_pct}%로 낮은 수준이며, 대부분의 언급이 명확한 감성을 포함합니다."
+            neu_interp = (f"중립 반응은 {neu_pct}%({neu_count}건)로 낮은 수준이며, "
+                         f"대부분의 언급이 명확한 감성을 포함합니다.")
 
         # 주의 포인트 해석
-        if neg_pct <= 5:
-            cau_interp = f"부정 반응은 {neg_pct}%로 매우 낮은 수준이며, 주요 불만 요인은 제한적입니다."
-        elif neg_pct <= 15:
-            cau_interp = f"부정 반응이 {neg_pct}%로 낮은 수준이나, 반복 언급되는 불만 키워드를 중점 모니터링할 필요가 있습니다."
+        if neg_pct <= 3:
+            cau_interp = (f"부정 반응은 {neg_pct}%({neg_count}건)로 매우 낮은 수준이며, "
+                         f"주요 불만 요인은 제한적입니다.")
+        elif neg_pct <= 10:
+            cau_interp = (f"부정 반응이 {neg_pct}%({neg_count}건)로 낮은 수준이나, "
+                         f"'{_neg_top_str}' 등의 표현이 반복 언급되고 있어 모니터링이 필요합니다.")
         else:
-            cau_interp = f"부정 반응이 {neg_pct}%로 개선이 필요합니다. 부정 연관어를 중심으로 운영 개선 방안을 검토하세요."
+            cau_interp = (f"부정 반응이 {neg_pct}%({neg_count}건)로, "
+                         f"'{_neg_top_str}' 관련 불만이 집중되고 있습니다. 운영 개선 방안을 검토하세요.")
 
-        # 긍정 Pros 포인트 (pos_voc 기반 자동 생성)
+        # Pros 포인트 — 실제 수치 기반
         pros_points = []
-        if pos_voc:
-            pros_points.append({"title": "음식 만족도", "body": f"긍정 리뷰 {pos_count}건 중 음식·메뉴에 대한 만족 언급이 주를 이루며, 재방문 의향을 높이는 핵심 요소로 작동하고 있습니다."})
+        if pos_count > 0:
+            pros_points.append({
+                "title": "음식 만족도",
+                "body": f"긍정 리뷰 {pos_count}건 중 음식·메뉴에 대한 만족 언급이 주를 이루며, 재방문 의향을 높이는 핵심 요소로 작동하고 있습니다."
+            })
         if pos_pct >= 70:
-            pros_points.append({"title": "공간 및 분위기", "body": "공간·분위기 관련 긍정 언급이 꾸준히 확인되며, 방문 경험의 질을 높이는 차별화 요소로 해석됩니다."})
+            pros_points.append({
+                "title": "공간 및 분위기",
+                "body": "공간·분위기 관련 긍정 언급이 꾸준히 확인되며, 방문 경험의 질을 높이는 차별화 요소로 해석됩니다."
+            })
         if _org_cnt > _ad_cnt:
-            pros_points.append({"title": "자발적 후기 우세", "body": f"내돈내산 비율이 {_org_pct}%로 높아, 실제 고객 경험에 기반한 진성 콘텐츠가 온라인 신뢰도를 강화하고 있습니다."})
+            pros_points.append({
+                "title": "자발적 후기 우세",
+                "body": f"내돈내산 비율이 {_org_pct}%({_org_cnt}건)로 높아, 실제 고객 경험에 기반한 진성 콘텐츠가 온라인 신뢰도를 강화하고 있습니다."
+            })
 
-        # 부정 Cons 포인트 (neg_voc 기반 자동 생성)
+        # Cons 포인트 — 실제 수치 기반
         cons_points = []
-        if neg_voc:
-            cons_points.append({"title": "개선 필요 사항", "body": f"부정 리뷰 {neg_count}건에서 반복 언급된 불만 요소를 중심으로 운영 개선 방안 마련이 필요합니다."})
+        if neg_count > 0:
+            cons_points.append({
+                "title": "개선 필요 사항",
+                "body": f"부정 리뷰 {neg_count}건에서 '{_neg_top_str}' 관련 불만이 반복 언급되고 있어 운영 개선 방안 마련이 필요합니다."
+            })
         if _ad_cnt > _org_cnt:
-            cons_points.append({"title": "광고 콘텐츠 비중", "body": f"블로그 콘텐츠 중 광고 비율이 {_ad_pct}%로, 자발적 후기 유도를 위한 고객 경험 개선이 필요합니다."})
+            cons_points.append({
+                "title": "광고 콘텐츠 비중",
+                "body": f"블로그 콘텐츠 중 광고 비율이 {_ad_pct}%({_ad_cnt}건)로, 자발적 후기 유도를 위한 고객 경험 개선이 필요합니다."
+            })
+        if not cons_points:
+            cons_points.append({
+                "title": "지속적 관리",
+                "body": f"현재 부정 반응이 {neg_pct}%로 매우 낮지만, 언급량 급증 구간에서 품질 유지를 위한 운영 모니터링을 권장합니다."
+            })
 
         sentiment = {
             "positive_count": pos_count,
@@ -1323,12 +1399,61 @@ if __name__ == "__main__":
                 return f"{y[2:]}.{m}"
             kw_period = f"{fmt_ym(all_months[0])}~{fmt_ym(all_months[-1])}" if len(all_months) > 1 else fmt_ym(all_months[0])
 
+        # Top 5: 각 카테고리에서 최대 2개씩 선정 후 전체 빈도순 정렬
+        def _top5_diverse(menu_kw, loc_kw, exp_kw, top30):
+            """메뉴/위치/경험/기타 카테고리 균형 있게 Top5 선정"""
+            selected = []
+            used = set()
+            # 각 카테고리에서 최고빈도 1개씩 먼저
+            for lst in [menu_kw, exp_kw, loc_kw]:
+                if lst and lst[0]["word"] not in used:
+                    selected.append(lst[0])
+                    used.add(lst[0]["word"])
+            # 부족하면 각 카테고리 2순위
+            for lst in [menu_kw, exp_kw, loc_kw]:
+                if len(selected) >= 5: break
+                if len(lst) > 1 and lst[1]["word"] not in used:
+                    selected.append(lst[1])
+                    used.add(lst[1]["word"])
+            # 그래도 부족하면 top30에서 미선정 항목 추가
+            for item in top30:
+                if len(selected) >= 5: break
+                if item["word"] not in used:
+                    selected.append(item)
+                    used.add(item["word"])
+            return selected[:5]
+
+        top5_diverse = _top5_diverse(menu_kw, loc_kw, exp_kw,
+                                      [{"word":w,"count":c} for w,c in top30])
+
+        # Top5 카테고리 라벨 부여
+        def _label_kw(word):
+            for hint in MENU_HINTS:
+                if hint in word: return "menu"
+            for hint in LOC_HINTS:
+                if hint in word: return "location"
+            for hint in EXP_HINTS:
+                if hint in word: return "experience"
+            return "other"
+
+        top5_labeled = []
+        cat_labels = {"menu":"메뉴 키워드","location":"위치 키워드",
+                      "experience":"경험 키워드","other":"핵심 키워드"}
+        for item in top5_diverse:
+            cat = _label_kw(item["word"])
+            top5_labeled.append({
+                "word":  item["word"],
+                "count": item["count"],
+                "category": cat_labels[cat],
+            })
+
         keyword_analysis = {
             "period": kw_period,
             "top_all": [{"word": w, "count": c} for w, c in top30[:15]],
             "menu":     menu_kw[:5],
             "location": loc_kw[:5],
             "experience": exp_kw[:5],
+            "top5": top5_labeled,
         }
 
         # ── 월별 블로그 집계 ────────────────────────────────────
@@ -1343,6 +1468,14 @@ if __name__ == "__main__":
                 elif at == "내돈내산": monthly[ym]["organic"] += 1
                 else: monthly[ym]["unknown"] += 1
         monthly_blog_stats = [{"month": k, **v} for k, v in sorted(monthly.items())]
+
+        # ── 월별 영수증 집계 ─────────────────────────────────
+        monthly_receipt = defaultdict(int)
+        for r in receipt_reviews:
+            date = r.get("date","")
+            if date and len(date) >= 7:
+                monthly_receipt[date[:7]] += 1
+        monthly_receipt_stats = [{"month": k, "count": v} for k, v in sorted(monthly_receipt.items())]
 
         # ── 경영 제언 자동 생성 ─────────────────────────────────
         insights = []
@@ -1395,6 +1528,7 @@ if __name__ == "__main__":
             "keyword_analysis":     keyword_analysis,
             "top_keywords_receipt": top_keywords_receipt,
             "monthly_blog_stats":   monthly_blog_stats,
+            "monthly_receipt_stats": monthly_receipt_stats,
             "insights":             insights,
         }
 
