@@ -1,7 +1,12 @@
 """
-crawler.py - SNS 분석 독립 크롤러 v41
+crawler.py - SNS 분석 독립 크롤러 v42
 subprocess로 실행되어 greenlet 충돌을 원천 차단.
 결과는 JSON 파일로 저장.
+
+v42 변경사항:
+  1. 날짜 파싱 4단계로 전면 강화 (HTML메타 → iframe → title/excerpt → full_text)
+  2. 날짜 파싱 성공/실패 로그 출력
+  3. 예외처리 fallback에도 title+excerpt 텍스트 파싱 적용
 
 v41 변경사항:
   1. 블로그 원문 방문 시 게시일 파싱 3단계 (DOM 선택자 → HTML 정규식 → URL 패턴)
@@ -614,58 +619,90 @@ def classify_blog_originals(blog_links):
                         try: title = page.title()[:120]
                         except Exception: pass
 
-                    # ── 날짜 파싱 ──────────────────────────────
+                    # ── 날짜 파싱 (4단계) ────────────────────────
+                    def _parse_ym(text):
+                        """텍스트에서 YYYY-MM 형태 날짜 추출"""
+                        pats = [
+                            r'(20\d{2})[.\-년\s]*(\d{1,2})[.\-월\s]',
+                            r'\[(20\d{2})[.\s]+(\d{1,2})\]',
+                            r'(\d{2})[.\-년\s]+(\d{1,2})[.\-월\s]',
+                            r'(\d{2})[.\-](\d{2})',
+                        ]
+                        for pat in pats:
+                            mt = re.search(pat, text)
+                            if mt:
+                                y, mo = mt.group(1), mt.group(2)
+                                if len(y) == 2:
+                                    y = "20" + y
+                                mo_int = int(mo)
+                                if 1 <= mo_int <= 12:
+                                    return f"{y}-{mo.zfill(2)}"
+                        return ""
+
                     post_date = ""
                     try:
-                        # ① mainFrame 내 날짜 선택자 시도
-                        frame = page.frame(name="mainFrame")
-                        date_selectors = [
-                            ".se_publishDate",
-                            "span.se_publishDate",
-                            ".blog2_series .date",
-                            ".se-module-text .se-publish-date",
-                            "p.date",
-                            ".c-header__date",
-                            "span.date",
-                            "div.se-dates",
-                        ]
-                        for sel in date_selectors:
-                            try:
-                                target_frame = frame if frame else page
-                                el = target_frame.locator(sel).first
-                                if el.is_visible(timeout=300):
-                                    raw_d = el.inner_text().strip()
-                                    m = re.search(r"(20\d{2})[.\-/\s](\d{1,2})[.\-/\s](\d{1,2})", raw_d)
-                                    if m:
-                                        post_date = f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
-                                        break
-                            except Exception:
-                                continue
-                        # ② HTML 소스에서 정규식으로 추출
+                        # ① HTML 소스에서 publishedTime/publishDate 메타 추출 (가장 확실)
+                        try:
+                            src = page.content()
+                            for pat in [
+                                r'"publishedDate"\s*:\s*"(20\d{2}-\d{2}-\d{2})',
+                                r'"publishDate"\s*:\s*"(20\d{2}-\d{2}-\d{2})',
+                                r'property="article:published_time"\s+content="(20\d{2}-\d{2}-\d{2})',
+                                r'datetime="(20\d{2}-\d{2}-\d{2})',
+                                r'"date"\s*:\s*"(20\d{2}-\d{2}-\d{2})',
+                                r'LogDate\s*=\s*"(20\d{2})\.\s*(\d{1,2})\.\s*(\d{1,2})',
+                            ]:
+                                mt = re.search(pat, src)
+                                if mt:
+                                    if len(mt.groups()) == 1:
+                                        post_date = mt.group(1)[:7]  # YYYY-MM
+                                    elif len(mt.groups()) == 3:
+                                        post_date = f"{mt.group(1)}-{mt.group(2).zfill(2)}"
+                                    break
+                        except Exception:
+                            pass
+
+                        # ② mainFrame HTML에서도 동일 시도
                         if not post_date:
                             try:
-                                src = frame.content() if frame else page.content()
-                                # publishDate 메타
-                                m = re.search(r'"publishDate"\s*:\s*"(20\d{2}-\d{2}-\d{2})', src)
-                                if not m:
-                                    m = re.search(r'se-publish-date[^>]*>(20\d{2})[.\-](\d{1,2})[.\-](\d{1,2})', src)
-                                if not m:
-                                    m = re.search(r'datetime="(20\d{2}-\d{2}-\d{2})', src)
-                                if m:
-                                    if len(m.groups()) == 1:
-                                        post_date = m.group(1)[:10]
-                                    elif len(m.groups()) == 3:
-                                        post_date = f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
+                                frame = page.frame(name="mainFrame")
+                                if frame:
+                                    fsrc = frame.content()
+                                    for pat in [
+                                        r'"publishedDate"\s*:\s*"(20\d{2}-\d{2}-\d{2})',
+                                        r'"publishDate"\s*:\s*"(20\d{2}-\d{2}-\d{2})',
+                                        r'se-publish-date[^>]*>(20\d{2})[.\-](\d{1,2})',
+                                        r'class="se_publishDate"[^>]*>(20\d{2})[.\-. ]+(\d{1,2})',
+                                        r'LogDate\s*=\s*"(20\d{2})\.\s*(\d{1,2})',
+                                    ]:
+                                        mt = re.search(pat, fsrc)
+                                        if mt:
+                                            if len(mt.groups()) == 1:
+                                                post_date = mt.group(1)[:7]
+                                            elif len(mt.groups()) >= 2:
+                                                mo_int = int(mt.group(2))
+                                                if 1 <= mo_int <= 12:
+                                                    post_date = f"{mt.group(1)}-{mt.group(2).zfill(2)}"
+                                            break
                             except Exception:
                                 pass
-                        # ③ URL에서 날짜 추출 (blog.naver.com/.../YYYYMMDD...)
+
+                        # ③ title + excerpt 텍스트에서 날짜 패턴 추출
                         if not post_date:
-                            m = re.search(r'/(20\d{6})\d{0,6}(?:/|$)', item["url"])
-                            if m:
-                                d = m.group(1)
-                                post_date = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
-                    except Exception:
-                        pass
+                            combined = (item.get("title","") + " " + item.get("excerpt","") + " " + (title or ""))
+                            post_date = _parse_ym(combined)
+
+                        # ④ full_text 앞 200자에서 날짜 패턴 추출
+                        if not post_date and full_text:
+                            post_date = _parse_ym(full_text[:200])
+
+                        if post_date:
+                            print(f"[날짜] {idx+1}번 → {post_date}")
+                        else:
+                            print(f"[날짜] {idx+1}번 → 미확인")
+
+                    except Exception as e:
+                        print(f"[날짜 오류] {e}")
 
                     results.append({
                         "title": title or "제목 없음",
@@ -681,12 +718,23 @@ def classify_blog_originals(blog_links):
                 except Exception:
                     excerpt = item.get("excerpt","")
                     ad_type = classify_ad(excerpt)
-                    # URL에서 날짜 추출 시도
+                    # title+excerpt에서 날짜 추출 시도
                     fallback_date = ""
-                    m = re.search(r'/(20\d{6})\d{0,6}(?:/|$)', item.get("url",""))
-                    if m:
-                        d = m.group(1)
-                        fallback_date = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+                    combined = item.get("title","") + " " + excerpt
+                    for pat in [
+                        r'(20\d{2})[.\-년\s]*(\d{1,2})[.\-월\s]',
+                        r'\[(20\d{2})[.\s]+(\d{1,2})\]',
+                        r'(\d{2})[.\-년\s]+(\d{1,2})[.\-월\s]',
+                        r'(\d{2})[.\-](\d{2})',
+                    ]:
+                        mt = re.search(pat, combined)
+                        if mt:
+                            y, mo = mt.group(1), mt.group(2)
+                            if len(y) == 2: y = "20" + y
+                            mo_int = int(mo)
+                            if 1 <= mo_int <= 12:
+                                fallback_date = f"{y}-{mo.zfill(2)}"
+                                break
                     results.append({
                         "title": item.get("title","제목 없음"),
                         "text": excerpt[:500],
