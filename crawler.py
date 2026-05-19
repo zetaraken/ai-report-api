@@ -1,7 +1,20 @@
 """
-crawler.py - SNS 분석 독립 크롤러 v52
+crawler.py - SNS 분석 독립 크롤러 v55
 subprocess로 실행되어 greenlet 충돌을 원천 차단.
 결과는 JSON 파일로 저장.
+
+v55 변경사항:
+  1. 영수증 날짜 '25.11.1.토' (연도2자리.월.일.요일) 패턴 추가
+  2. 형식1(연도포함) 우선, 형식2(연도없음) 폴백으로 처리
+
+v54 변경사항:
+  1. 영수증 날짜 '4.15.수' (월.일.요일) 패턴 최우선 처리
+  2. 연도 추정: 현재 월보다 크면 전년도
+  3. datetime import 추가
+
+v53 변경사항:
+  1. _parse_receipt_date 패턴 전면 강화 (10개 패턴: 26.04.15, data-date, 방문 2026.04, 2026년 4월 등)
+  2. HTML 탐색 범위 2000→5000자로 확장
 
 v52 변경사항:
   1. 영수증 texts_found 계산 버그 수정: raw가 튜플 리스트인데 str.strip() 호출 → zero_streak 오탐으로 9건 후 조기 종료
@@ -70,6 +83,7 @@ import random
 import re
 import sys
 import time
+from datetime import datetime as _dt
 from pathlib import Path
 from urllib.parse import quote
 
@@ -363,25 +377,64 @@ def crawl_receipt_reviews(place_id, target=500):
         return driver
 
     def _parse_receipt_date(html):
-        """영수증 리뷰 HTML에서 날짜 추출 → YYYY-MM"""
-        for pat in [
-            r'"visitDate"\s*:\s*"?(\d{8})"?',
-            r'"visitDate"\s*:\s*"(20\d{2})-(\d{2})',
-            r'pui__blind[^>]*>(20\d{2})[.](\d{2})',
-            r'pui__gfuUIT[^>]*>(\d{2})[.](\d{2})',
-            r'(20\d{2})[.](\d{2})[.]\d{2}',
+        """영수증 리뷰 HTML에서 날짜 추출 → YYYY-MM
+        실제 네이버 플레이스 영수증 날짜 형식: '4.15.수' (월.일.요일)
+        """
+        now = _dt.now()
+        cur_year = now.year
+        cur_month = now.month
+
+        # ★ 최우선: 네이버 플레이스 영수증 날짜 실제 표기
+        # 형식1: "25.11.1.토" (연도2자리.월.일.요일)
+        # 형식2: "4.15.수"    (월.일.요일, 연도 없음)
+        weekdays = "월화수목금토일"
+
+        # 형식1 우선 — 연도2자리.월.일.요일
+        pat_ymd = r'(\d{2})[.](\d{1,2})[.]\d{1,2}[.][' + weekdays + ']'
+        mt = re.search(pat_ymd, html)
+        if mt:
+            y_int, mo_int = int(mt.group(1)), int(mt.group(2))
+            if 20 <= y_int <= 29 and 1 <= mo_int <= 12:
+                return f"20{mt.group(1)}-{str(mo_int).zfill(2)}"
+
+        # 형식2 — 월.일.요일 (연도 추정)
+        pat_md = r'(\d{1,2})[.]\d{1,2}[.][' + weekdays + ']'
+        mt = re.search(pat_md, html)
+        if mt:
+            mo_int = int(mt.group(1))
+            if 1 <= mo_int <= 12:
+                year = cur_year if mo_int <= cur_month else cur_year - 1
+                return f"{year}-{str(mo_int).zfill(2)}"
+
+        # 4자리 연도 명시 패턴
+        for pat, ngrp in [
+            (r'"visitDate"\s*:\s*"?(\d{8})"?',         1),
+            (r'"visitDate"\s*:\s*"(20\d{2})-(\d{2})', 2),
+            (r'"date"\s*:\s*"(20\d{2})-(\d{2})',      2),
+            (r'data-date="(20\d{2})-(\d{2})',           2),
+            (r'(20\d{2})년\s*(\d{1,2})월',             2),
+            (r'(20\d{2})[.](\d{2})[.]\d{2}',          2),
+            (r'(20\d{2})-(0[1-9]|1[0-2])-\d{2}',       2),
         ]:
             mt = re.search(pat, html)
             if mt:
-                if len(mt.groups()) == 1:
+                if ngrp == 1:
                     raw = mt.group(1)
                     if len(raw) == 8 and 2020 <= int(raw[:4]) <= 2030:
                         return f"{raw[:4]}-{raw[4:6]}"
-                elif len(mt.groups()) == 2:
+                else:
                     y, mo = mt.group(1), mt.group(2)
-                    if len(y) == 2: y = "20" + y
-                    if 2020 <= int(y) <= 2030 and 1 <= int(mo) <= 12:
-                        return f"{y}-{mo.zfill(2)}"
+                    mo_int = int(mo)
+                    if 2020 <= int(y) <= 2030 and 1 <= mo_int <= 12:
+                        return f"{y}-{str(mo_int).zfill(2)}"
+
+        # 2자리 연도 패턴 (26.04.15 형태)
+        mt = re.search(r'(\d{2})[.](\d{2})[.]\d{2}', html)
+        if mt:
+            y_int, mo_int = int(mt.group(1)), int(mt.group(2))
+            if 20 <= y_int <= 29 and 1 <= mo_int <= 12:
+                return f"20{mt.group(1)}-{str(mo_int).zfill(2)}"
+
         return ""
 
     def collect_from_html(html):
@@ -403,7 +456,8 @@ def crawl_receipt_reviews(place_id, target=500):
                     parent = el.find_parent("li") or el.find_parent("div")
                     date = _parse_receipt_date(str(parent)) if parent else ""
                     if not date:
-                        date = _parse_receipt_date(html[:2000])  # 전체 HTML 앞부분에서 탐색
+                        # 전체 HTML에서 날짜 탐색 (최대 5000자)
+                        date = _parse_receipt_date(html[:5000])
                     items.append((t, date))
         else:
             # 폴백: li.pui__X35jYm
