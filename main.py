@@ -1,6 +1,10 @@
 """
-SNS 분석 자동화 솔루션 - 백엔드 API v37
+SNS 분석 자동화 솔루션 - 백엔드 API v38
 크롤링을 subprocess(crawler.py)로 분리 실행 → greenlet 충돌 완전 차단
+
+v38 변경사항:
+  1. save_report/save_job 예외 절대 전파 방지 (DB 오류가 크롤링 결과를 삭제하지 않도록)
+  2. 저장 성공/실패 로그 상세화
 
 v37 변경사항:
   1. DB 연결 시도 로그 상세화 (host/port/user 출력)
@@ -202,22 +206,27 @@ def delete_merchant_db(mid):
 
 # ── 리포트 CRUD ──────────────────────────────────────────────────
 def save_report(mid, report):
-    conn = get_conn()
-    if conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO reports (merchant_id, data, crawled_at)
-                    VALUES (%s, %s, %s)
-                    ON DUPLICATE KEY UPDATE data=%s, crawled_at=%s
-                """, (mid, json.dumps(report, ensure_ascii=False),
-                      report.get("crawled_at", datetime.now().isoformat()),
-                      json.dumps(report, ensure_ascii=False),
-                      report.get("crawled_at", datetime.now().isoformat())))
-            return
-        except Exception as e:
-            print(f"[DB] save_report 오류: {e}")
-    _save_json(REPORTS_DIR / f"{mid}.json", report)
+    """리포트 저장 — DB 실패 시 JSON 파일로 폴백 (예외 절대 전파 안 함)"""
+    try:
+        conn = get_conn()
+        if conn:
+            try:
+                data_str = json.dumps(report, ensure_ascii=False)
+                crawled_at = report.get("crawled_at", datetime.now().isoformat())
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO reports (merchant_id, data, crawled_at)
+                        VALUES (%s, %s, %s)
+                        ON DUPLICATE KEY UPDATE data=%s, crawled_at=%s
+                    """, (mid, data_str, crawled_at, data_str, crawled_at))
+                print(f"[DB] save_report 성공: {mid}")
+                return
+            except Exception as e:
+                print(f"[DB] save_report DB 오류 → JSON 폴백: {e}")
+        _save_json(REPORTS_DIR / f"{mid}.json", report)
+        print(f"[DB] save_report JSON 저장: {mid}")
+    except Exception as e:
+        print(f"[DB] save_report 치명 오류 (무시): {e}")
 
 def load_report(mid):
     conn = get_conn()
@@ -236,26 +245,30 @@ def load_report(mid):
 CRAWL_JOBS: Dict[str, Dict] = {}
 
 def save_job(job):
-    CRAWL_JOBS[job["id"]] = job
-    conn = get_conn()
-    if conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO crawl_jobs (id, merchant_id, merchant_name, status, progress, message, started_at, data)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON DUPLICATE KEY UPDATE
-                        status=%s, progress=%s, message=%s, data=%s
-                """, (job["id"], job.get("merchant_id",""), job.get("merchant_name",""),
-                      job.get("status","pending"), job.get("progress",0), job.get("message",""),
-                      job.get("started_at", datetime.now().isoformat()),
-                      json.dumps(job, ensure_ascii=False),
-                      job.get("status","pending"), job.get("progress",0),
-                      job.get("message",""), json.dumps(job, ensure_ascii=False)))
-            return
-        except Exception as e:
-            print(f"[DB] save_job 오류: {e}")
-    _save_json(JOBS_DIR / f"{job['id']}.json", job)
+    """작업 상태 저장 — 예외 절대 전파 안 함"""
+    try:
+        CRAWL_JOBS[job["id"]] = job
+        conn = get_conn()
+        if conn:
+            try:
+                data_str = json.dumps(job, ensure_ascii=False)
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO crawl_jobs (id, merchant_id, merchant_name, status, progress, message, started_at, data)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON DUPLICATE KEY UPDATE
+                            status=%s, progress=%s, message=%s, data=%s
+                    """, (job["id"], job.get("merchant_id",""), job.get("merchant_name",""),
+                          job.get("status","pending"), job.get("progress",0), job.get("message",""),
+                          job.get("started_at", datetime.now().isoformat()), data_str,
+                          job.get("status","pending"), job.get("progress",0),
+                          job.get("message",""), data_str))
+                return
+            except Exception as e:
+                print(f"[DB] save_job DB 오류 → JSON 폴백: {e}")
+        _save_json(JOBS_DIR / f"{job['id']}.json", job)
+    except Exception as e:
+        print(f"[DB] save_job 치명 오류 (무시): {e}")
 
 def load_job(job_id):
     if job_id in CRAWL_JOBS:
