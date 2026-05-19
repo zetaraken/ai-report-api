@@ -1,6 +1,11 @@
 """
-SNS 분석 자동화 솔루션 - 백엔드 API v36
+SNS 분석 자동화 솔루션 - 백엔드 API v37
 크롤링을 subprocess(crawler.py)로 분리 실행 → greenlet 충돌 완전 차단
+
+v37 변경사항:
+  1. DB 연결 시도 로그 상세화 (host/port/user 출력)
+  2. connect_timeout=10 추가 (연결 지연 방지)
+  3. 불필요한 pool import 제거
 
 v36 변경사항:
   1. 데이터 저장소 JSON 파일 → 시놀로지 MariaDB로 전환
@@ -52,13 +57,14 @@ def init_db():
     if not USE_DB:
         print("[DB] 환경변수 미설정 → JSON 파일 모드로 동작")
         return
+    print(f"[DB] 연결 시도: {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
     try:
         import pymysql
-        from pymysql import pool as pymysql_pool
         db_pool = pymysql.connect(
             host=DB_HOST, port=DB_PORT, user=DB_USER,
             password=DB_PASSWORD, database=DB_NAME,
             charset="utf8mb4", autocommit=True,
+            connect_timeout=10,
             cursorclass=pymysql.cursors.DictCursor,
         )
         cur = db_pool.cursor()
@@ -115,6 +121,7 @@ def get_conn():
                 host=DB_HOST, port=DB_PORT, user=DB_USER,
                 password=DB_PASSWORD, database=DB_NAME,
                 charset="utf8mb4", autocommit=True,
+                connect_timeout=10,
                 cursorclass=pymysql.cursors.DictCursor,
             )
             return db_pool
