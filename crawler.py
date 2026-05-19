@@ -462,14 +462,7 @@ def crawl_blog_links(place_id, merchant_name="", target=100):
                     title = a.get_text(strip=True)[:120]
                     parent = a.find_parent("li") or a.find_parent("div")
                     excerpt = parent.get_text(strip=True)[:300] if parent else ""
-                    # 날짜 파싱: "2026. 1. 3." 또는 "2026.01.03" 형태
-                    date_str = ""
-                    if parent:
-                        date_m = re.search(r'(\d{4})[.\-]\s*(\d{1,2})[.\-]\s*(\d{1,2})', parent.get_text())
-                        if date_m:
-                            y, m, d = date_m.group(1), date_m.group(2).zfill(2), date_m.group(3).zfill(2)
-                            date_str = f"{y}-{m}-{d}"
-                    links.append({"url": href, "title": title, "excerpt": excerpt, "date": date_str})
+                    links.append({"url": href, "title": title, "excerpt": excerpt})
 
                 current = len(links)
                 print(f"[블로그] 라운드 {round_num}: {current}건")
@@ -624,7 +617,6 @@ def classify_blog_originals(blog_links):
                         "ad_basis": "협찬 배지 감지 (이미지형 UI)" if is_sponsored_badge else get_basis(full_text, ad_type),
                         "source": "naver_blog",
                         "url": item["url"],
-                        "date": item.get("date", ""),
                     })
                     print(f"[블로그 원문] {idx+1}/{total} {ad_type} - {(title or '')[:30]}")
 
@@ -897,41 +889,159 @@ if __name__ == "__main__":
     receipt_list = receipt
     blog_list    = blog_reviews
 
-    # ── 키워드 Top 10 추출 ──────────────────────────────────────
-    def extract_keywords(reviews, top_n=10):
-        stopwords = {
-            "이","가","을","를","은","는","의","에","에서","와","과","도","만","로","으로",
-            "이다","있다","없다","하다","되다","그","수","것","때","곳","좀","더","정말",
-            "너무","매우","아주","진짜","완전","거의","다시","또","항상","제목","없음",
-            "블로그","리뷰","방문","가게","식당","맛집","네이버","플레이스",
-            "이전","다음","펼쳐서","더보기","닫기","감자탕","감자","순자매",
-        }
-        from collections import Counter
-        word_counts = Counter()
-        for r in reviews:
-            text = r.get("text","") + " " + r.get("title","")
-            words = re.findall(r'[가-힣]{2,8}', text)
-            for w in words:
-                if w not in stopwords:
-                    word_counts[w] += 1
-        return [{"word": w, "count": c} for w, c in word_counts.most_common(top_n)]
+    def _build_insight(blog_reviews, receipt_reviews):
+        """감성분석, VOC, 키워드, 월별, 경영제언 데이터 생성"""
+        from collections import Counter, defaultdict
 
-    # ── 월별 블로그 집계 ────────────────────────────────────────
-    def monthly_blog_stats(blog_reviews):
-        from collections import defaultdict
-        monthly = defaultdict(lambda: {"total":0,"ad":0,"organic":0})
+        # ── 감성 키워드 정의 ─────────────────────────────────────
+        POS_KW = [
+            "맛있", "최고", "추천", "좋아", "훌륭", "맛집", "깔끔", "정갈", "친절",
+            "푸짐", "양많", "부드럽", "신선", "맛나", "맛있어", "좋았", "만족", "훌륭",
+            "맛있는", "재방문", "또올", "또왔", "단골", "대박", "강추", "완벽", "행복",
+            "감동", "맛있었", "맛있다", "맛있고", "좋고", "좋은", "좋다", "맛있네",
+        ]
+        NEG_KW = [
+            "별로", "실망", "불친절", "오래", "기다", "웨이팅", "늦", "차갑", "식어",
+            "짜", "싱거", "냄새", "좁", "시끄", "비싸", "아쉽", "부족", "혼잡",
+            "줄서", "대기", "불만", "최악", "다시는", "너무오래", "응대", "느리",
+        ]
+
+        all_texts = [r.get("text", "") + r.get("title", "") for r in blog_reviews + receipt_reviews]
+
+        def sentiment_score(text):
+            p = sum(1 for k in POS_KW if k in text)
+            n = sum(1 for k in NEG_KW if k in text)
+            if p > n: return "positive"
+            if n > p: return "negative"
+            return "neutral"
+
+        pos_count = neg_count = neu_count = 0
+        pos_voc, neg_voc = [], []
+        for r in blog_reviews + receipt_reviews:
+            txt = r.get("text", "") + r.get("title", "")
+            s = sentiment_score(txt)
+            if s == "positive":
+                pos_count += 1
+                if len(pos_voc) < 3 and len(txt) > 20:
+                    snippet = txt.replace("\n", " ")[:80].strip()
+                    if snippet: pos_voc.append(snippet)
+            elif s == "negative":
+                neg_count += 1
+                if len(neg_voc) < 3 and len(txt) > 20:
+                    snippet = txt.replace("\n", " ")[:80].strip()
+                    if snippet: neg_voc.append(snippet)
+            else:
+                neu_count += 1
+
+        total_s = max(pos_count + neg_count + neu_count, 1)
+        sentiment = {
+            "positive_count": pos_count,
+            "negative_count": neg_count,
+            "neutral_count":  neu_count,
+            "positive_pct": round(pos_count / total_s * 100),
+            "negative_pct": round(neg_count / total_s * 100),
+            "neutral_pct":  round(neu_count / total_s * 100),
+            "pos_voc": pos_voc,
+            "neg_voc": neg_voc,
+        }
+
+        # ── 긍정/부정 연관어 Top 5 ──────────────────────────────
+        pos_words = Counter()
+        neg_words = Counter()
+        stopwords = {"이","가","을","를","은","는","의","에","에서","와","과","도","만",
+                     "로","으로","수","것","때","곳","좀","더","정말","너무","매우",
+                     "아주","진짜","완전","다시","또","제목","없음","블로그","리뷰",
+                     "방문","가게","식당","맛집","네이버","플레이스","이전","다음"}
+        for r in blog_reviews + receipt_reviews:
+            txt = r.get("text", "")
+            s   = sentiment_score(txt)
+            words = re.findall(r'[가-힣]{2,8}', txt)
+            for w in words:
+                if w in stopwords: continue
+                if s == "positive": pos_words[w] += 1
+                elif s == "negative": neg_words[w] += 1
+
+        # ── 블로그 핵심 키워드 Top 10 ───────────────────────────
+        stopwords_kw = stopwords | {"감자탕","감자","순자매","온빈","신정호"}
+        kw_counter = Counter()
+        for r in blog_reviews:
+            words = re.findall(r'[가-힣]{2,8}', r.get("text","") + r.get("title",""))
+            for w in words:
+                if w not in stopwords_kw: kw_counter[w] += 1
+        top_keywords_blog = [{"word": w, "count": c} for w, c in kw_counter.most_common(10)]
+
+        receipt_kw = Counter()
+        for r in receipt_reviews:
+            words = re.findall(r'[가-힣]{2,8}', r.get("text","") + r.get("title",""))
+            for w in words:
+                if w not in stopwords_kw: receipt_kw[w] += 1
+        top_keywords_receipt = [{"word": w, "count": c} for w, c in receipt_kw.most_common(10)]
+
+        # ── 월별 블로그 집계 ────────────────────────────────────
+        monthly = defaultdict(lambda: {"total":0,"ad":0,"organic":0,"unknown":0})
         for r in blog_reviews:
             date = r.get("date","")
             if date and len(date) >= 7:
                 ym = date[:7]
                 monthly[ym]["total"] += 1
-                if r.get("ad_type") == "광고":     monthly[ym]["ad"] += 1
-                elif r.get("ad_type") == "내돈내산": monthly[ym]["organic"] += 1
-        return [{"month": k, **v} for k, v in sorted(monthly.items())]
+                at = r.get("ad_type","")
+                if at == "광고": monthly[ym]["ad"] += 1
+                elif at == "내돈내산": monthly[ym]["organic"] += 1
+                else: monthly[ym]["unknown"] += 1
+        monthly_blog_stats = [{"month": k, **v} for k, v in sorted(monthly.items())]
 
-    top_keywords_blog    = extract_keywords(blog_list, top_n=10)
-    top_keywords_receipt = extract_keywords(receipt_list, top_n=10)
-    monthly_stats        = monthly_blog_stats(blog_list)
+        # ── 경영 제언 자동 생성 ─────────────────────────────────
+        insights = []
+        total_blog = len(blog_reviews)
+        if total_blog > 0:
+            ad_pct = round(sum(1 for r in blog_reviews if r.get("ad_type")=="광고") / total_blog * 100)
+            org_pct = round(sum(1 for r in blog_reviews if r.get("ad_type")=="내돈내산") / total_blog * 100)
+            neg_pct_val = round(neg_count / total_s * 100)
+
+            if org_pct >= 60:
+                insights.append({
+                    "type": "positive",
+                    "title": "높은 내돈내산 비율",
+                    "body": f"블로그 리뷰 중 내돈내산이 {org_pct}%로, 실제 고객의 자발적 방문 후기가 많습니다. 브랜드 신뢰도가 높은 상태입니다."
+                })
+            if ad_pct >= 40:
+                insights.append({
+                    "type": "warning",
+                    "title": "광고 비율 점검 필요",
+                    "body": f"블로그 리뷰 중 광고성 게시글이 {ad_pct}%입니다. 내돈내산 후기 유도 이벤트(예: 리뷰 작성 시 음료 서비스)를 검토해 보세요."
+                })
+            if neg_pct_val >= 15:
+                # 부정 키워드 상위 추출
+                top_neg = [w for w, _ in neg_words.most_common(3)]
+                neg_str = ", ".join(top_neg) if top_neg else "대기·혼잡"
+                insights.append({
+                    "type": "warning",
+                    "title": "부정 반응 모니터링 필요",
+                    "body": f"전체 리뷰 중 부정 반응이 {neg_pct_val}%입니다. 주요 불만 키워드: {neg_str}. 피크 타임 운영 효율화를 검토하세요."
+                })
+            if neg_pct_val < 15 and pos_count / total_s >= 0.7:
+                insights.append({
+                    "type": "positive",
+                    "title": "긍정 반응 우세",
+                    "body": f"전체 리뷰의 {round(pos_count/total_s*100)}%가 긍정 반응입니다. 현재 서비스 품질을 유지하면서 재방문 고객 혜택을 강화하면 충성 고객 비율이 높아집니다."
+                })
+            if len(top_keywords_blog) > 0:
+                top_word = top_keywords_blog[0]["word"]
+                insights.append({
+                    "type": "info",
+                    "title": f"핵심 언급 키워드: '{top_word}'",
+                    "body": f"블로그 리뷰에서 '{top_word}'가 가장 많이 언급됩니다. 이 키워드를 네이버 플레이스 소개글과 마케팅 문구에 적극 활용하세요."
+                })
+
+        return {
+            "sentiment": sentiment,
+            "pos_keywords": [{"word": w, "count": c} for w, c in pos_words.most_common(5)],
+            "neg_keywords": [{"word": w, "count": c} for w, c in neg_words.most_common(5)],
+            "top_keywords_blog":    top_keywords_blog,
+            "top_keywords_receipt": top_keywords_receipt,
+            "monthly_blog_stats":   monthly_blog_stats,
+            "insights":             insights,
+        }
 
     result = {
         "place_counts": counts,
@@ -951,9 +1061,7 @@ if __name__ == "__main__":
             "blog_ad_count":      sum(1 for r in blog_list if r.get("ad_type")=="광고"),
             "blog_organic_count": sum(1 for r in blog_list if r.get("ad_type")=="내돈내산"),
             "blog_unknown_count": sum(1 for r in blog_list if r.get("ad_type")=="판별불가"),
-            "top_keywords_blog":    top_keywords_blog,
-            "top_keywords_receipt": top_keywords_receipt,
-            "monthly_blog_stats":   monthly_stats,
+            **_build_insight(blog_list, receipt_list),
         }
     }
 
