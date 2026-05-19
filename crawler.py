@@ -1,7 +1,11 @@
 """
-crawler.py - SNS 분석 독립 크롤러 v42
+crawler.py - SNS 분석 독립 크롤러 v43
 subprocess로 실행되어 greenlet 충돌을 원천 차단.
 결과는 JSON 파일로 저장.
+
+v43 변경사항:
+  1. _parse_ym 오탐 방지 강화: 2자리 연도는 '년+월' 조합만 허용
+  2. 연도 범위 2020~2030으로 제한 (게시글 번호 등 오탐 차단)
 
 v42 변경사항:
   1. 날짜 파싱 4단계로 전면 강화 (HTML메타 → iframe → title/excerpt → full_text)
@@ -619,24 +623,32 @@ def classify_blog_originals(blog_links):
                         try: title = page.title()[:120]
                         except Exception: pass
 
-                    # ── 날짜 파싱 (4단계) ────────────────────────
+                    # ── 날짜 파싱 (4단계, 오탐 방지) ──────────────
                     def _parse_ym(text):
-                        """텍스트에서 YYYY-MM 형태 날짜 추출"""
-                        pats = [
+                        """텍스트에서 YYYY-MM 형태 날짜 추출 — 오탐 방지 강화"""
+                        # ① 4자리 연도 명시 패턴 (가장 확실, 2020~2030)
+                        for pat in [
                             r'(20\d{2})[.\-년\s]*(\d{1,2})[.\-월\s]',
                             r'\[(20\d{2})[.\s]+(\d{1,2})\]',
-                            r'(\d{2})[.\-년\s]+(\d{1,2})[.\-월\s]',
-                            r'(\d{2})[.\-](\d{2})',
-                        ]
-                        for pat in pats:
+                            r'(20\d{2})[.\-년\s]*(\d{1,2})월',
+                        ]:
                             mt = re.search(pat, text)
                             if mt:
                                 y, mo = mt.group(1), mt.group(2)
-                                if len(y) == 2:
-                                    y = "20" + y
                                 mo_int = int(mo)
-                                if 1 <= mo_int <= 12:
+                                if 1 <= mo_int <= 12 and 2020 <= int(y) <= 2030:
                                     return f"{y}-{mo.zfill(2)}"
+                        # ② 2자리 연도 — 반드시 "년"+"월" 조합만 허용 (오탐 방지)
+                        for pat in [
+                            r'(?<!\d)(\d{2})년\s*(\d{1,2})월',
+                            r'(?<!\d)(\d{2})[.](\d{2})월',
+                        ]:
+                            mt = re.search(pat, text)
+                            if mt:
+                                y, mo = mt.group(1), mt.group(2)
+                                y_int, mo_int = int(y), int(mo)
+                                if 20 <= y_int <= 29 and 1 <= mo_int <= 12:
+                                    return f"20{y}-{mo.zfill(2)}"
                         return ""
 
                     post_date = ""
@@ -718,21 +730,21 @@ def classify_blog_originals(blog_links):
                 except Exception:
                     excerpt = item.get("excerpt","")
                     ad_type = classify_ad(excerpt)
-                    # title+excerpt에서 날짜 추출 시도
+                    # title+excerpt에서 날짜 추출 시도 (오탐 방지)
                     fallback_date = ""
                     combined = item.get("title","") + " " + excerpt
                     for pat in [
                         r'(20\d{2})[.\-년\s]*(\d{1,2})[.\-월\s]',
                         r'\[(20\d{2})[.\s]+(\d{1,2})\]',
-                        r'(\d{2})[.\-년\s]+(\d{1,2})[.\-월\s]',
-                        r'(\d{2})[.\-](\d{2})',
+                        r'(20\d{2})[.\-년\s]*(\d{1,2})월',
+                        r'(?<!\d)(\d{2})년\s*(\d{1,2})월',
                     ]:
                         mt = re.search(pat, combined)
                         if mt:
                             y, mo = mt.group(1), mt.group(2)
                             if len(y) == 2: y = "20" + y
-                            mo_int = int(mo)
-                            if 1 <= mo_int <= 12:
+                            y_int, mo_int = int(y), int(mo)
+                            if 2020 <= y_int <= 2030 and 1 <= mo_int <= 12:
                                 fallback_date = f"{y}-{mo.zfill(2)}"
                                 break
                     results.append({
