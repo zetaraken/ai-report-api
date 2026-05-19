@@ -1,7 +1,10 @@
 """
-crawler.py - SNS 분석 독립 크롤러 v49
+crawler.py - SNS 분석 독립 크롤러 v50
 subprocess로 실행되어 greenlet 충돌을 원천 차단.
 결과는 JSON 파일로 저장.
+
+v50 변경사항:
+  1. UnboundLocalError 수정: pos_words 참조를 Counter 선언 이후로 이동
 
 v49 변경사항:
   1. 영수증 리뷰 날짜 수집 추가 (pui__blind 등 선택자 기반)
@@ -1140,11 +1143,9 @@ if __name__ == "__main__":
         _ad_pct  = round(_ad_cnt  / _total_b * 100)
         _org_pct = round(_org_cnt / _total_b * 100)
 
-        # 긍정 키워드 상위 3개 추출 (불용어 제외 후 pos_words 기준)
-        _pos_top = [w for w, _ in pos_words.most_common(5)][:3]
-        _neg_top = [w for w, _ in neg_words.most_common(5)][:3]
-        _pos_top_str = "·".join(_pos_top) if _pos_top else "만족"
-        _neg_top_str = "·".join(_neg_top) if _neg_top else "불만"
+        # 긍정/부정 키워드 상위어 — pos_words 선언 이후 채워짐 (초기값)
+        _pos_top_str = "만족"
+        _neg_top_str = "불만"
 
         # 긍정 반응 해석 — 수치+키워드 포함
         if pos_pct >= 80:
@@ -1315,6 +1316,31 @@ if __name__ == "__main__":
                 if w in stopwords or len(w) < 2: continue
                 if s == "positive": pos_words[w] += 1
                 elif s == "negative": neg_words[w] += 1
+
+        # pos_words 완성 후 정성 해석 문자열 업데이트
+        _pos_top = [w for w, _ in pos_words.most_common(5)][:3]
+        _neg_top = [w for w, _ in neg_words.most_common(5)][:3]
+        _pos_top_str = "·".join(_pos_top) if _pos_top else "만족"
+        _neg_top_str = "·".join(_neg_top) if _neg_top else "불만"
+
+        # 정성 해석 문자열 업데이트 (pos_words 완성 후)
+        if pos_pct >= 80 and _pos_top:
+            pos_interp = (f"수집된 전체 리뷰 {pos_count+neg_count+neu_count}건의 {pos_pct}%가 긍정 반응으로, "
+                         f"방문 고객의 전반적인 만족도가 높은 상태입니다. "
+                         f"'{_pos_top_str}' 등의 표현이 반복적으로 확인됩니다.")
+        if neg_pct <= 10 and _neg_top:
+            cau_interp = (f"부정 반응이 {neg_pct}%({neg_count}건)로 낮은 수준이나, "
+                         f"'{_neg_top_str}' 등의 표현이 반복 언급되고 있어 모니터링이 필요합니다.")
+        elif neg_pct > 10 and _neg_top:
+            cau_interp = (f"부정 반응이 {neg_pct}%({neg_count}건)로, "
+                         f"'{_neg_top_str}' 관련 불만이 집중되고 있습니다. 운영 개선 방안을 검토하세요.")
+        if neg_count > 0 and _neg_top:
+            # Cons 포인트 업데이트
+            if cons_points:
+                cons_points[0]["body"] = (
+                    f"부정 리뷰 {neg_count}건에서 '{_neg_top_str}' 관련 불만이 반복 언급되고 있어 "
+                    f"운영 개선 방안 마련이 필요합니다."
+                )
 
         # ── 블로그 핵심 키워드 Top 10 ───────────────────────────
         kw_counter = Counter()
