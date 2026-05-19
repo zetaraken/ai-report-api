@@ -1,7 +1,10 @@
 """
-crawler.py - SNS 분석 독립 크롤러 v51
+crawler.py - SNS 분석 독립 크롤러 v52
 subprocess로 실행되어 greenlet 충돌을 원천 차단.
 결과는 JSON 파일로 저장.
+
+v52 변경사항:
+  1. 영수증 texts_found 계산 버그 수정: raw가 튜플 리스트인데 str.strip() 호출 → zero_streak 오탐으로 9건 후 조기 종료
 
 v51 변경사항:
   1. collect_from_html 수정: li.pui__X35jYm 우선 선택 → 기존 div.pui__vn15t2 방식 복원
@@ -473,7 +476,7 @@ def crawl_receipt_reviews(place_id, target=500):
                 print(f"[영수증] 목표 달성: {current}건")
                 break
 
-            texts_found = len([t for t in raw if len(t.strip()) >= 10])
+            texts_found = len([item for item in raw if len((item[0] if isinstance(item, tuple) else item).strip()) >= 10])
             if texts_found == 0:
                 zero_streak += 1
                 if zero_streak >= 5:
