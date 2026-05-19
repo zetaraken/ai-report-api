@@ -1,7 +1,11 @@
 """
-crawler.py - SNS 분석 독립 크롤러 v50
+crawler.py - SNS 분석 독립 크롤러 v51
 subprocess로 실행되어 greenlet 충돌을 원천 차단.
 결과는 JSON 파일로 저장.
+
+v51 변경사항:
+  1. collect_from_html 수정: li.pui__X35jYm 우선 선택 → 기존 div.pui__vn15t2 방식 복원
+  2. 날짜는 상위 부모 요소에서 별도 추출 (영수증 건수 복원)
 
 v50 변경사항:
   1. UnboundLocalError 수정: pos_words 참조를 Counter 선언 이후로 이동
@@ -382,22 +386,30 @@ def crawl_receipt_reviews(place_id, target=500):
         items = []  # (text, date) 튜플
         SKIP = {"펼쳐서 더보기","더보기","반응 남기기","좋아요","신고","접기"}
 
-        # 리뷰 아이템별로 텍스트+날짜 함께 추출
-        review_els = soup.select("li.pui__X35jYm") or soup.select("div.pui__vn15t2")
-        if review_els:
-            for li in review_els:
+        # 기존 방식 유지: div.pui__vn15t2에서 텍스트 추출 (안정적)
+        text_els = soup.select("div.pui__vn15t2")
+        if not text_els:
+            text_els = soup.select("div[class*='vn15t2']")
+
+        if text_els:
+            for el in text_els:
+                t = el.get_text(strip=True)
+                for s in SKIP: t = t.replace(s, "").strip()
+                if len(t) >= 10:
+                    # 날짜는 상위 li 요소에서 추출 시도
+                    parent = el.find_parent("li") or el.find_parent("div")
+                    date = _parse_receipt_date(str(parent)) if parent else ""
+                    if not date:
+                        date = _parse_receipt_date(html[:2000])  # 전체 HTML 앞부분에서 탐색
+                    items.append((t, date))
+        else:
+            # 폴백: li.pui__X35jYm
+            for li in soup.select("li.pui__X35jYm"):
                 t = li.get_text(separator=" ", strip=True)
                 for s in SKIP: t = t.replace(s, "").strip()
                 if len(t) >= 10:
                     date = _parse_receipt_date(str(li))
                     items.append((t, date))
-        else:
-            # 폴백: 전체 HTML에서 텍스트만
-            for el in soup.select("div.pui__vn15t2"):
-                t = el.get_text(strip=True)
-                for s in SKIP: t = t.replace(s, "").strip()
-                if len(t) >= 10:
-                    items.append((t, ""))
         return items
 
     def sel_scroll(driver, steps=5):
